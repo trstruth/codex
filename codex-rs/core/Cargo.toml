@@ -56,6 +56,19 @@ uuid = { version = "1", features = ["serde", "v4"] }
 whoami = "1.6.0"
 wildmatch = "2.4.0"
 
+# Optional Azure auth support for Managed Identity.
+[features]
+default = []
+azure-auth = ["azure_identity", "azure_core"]
+
+[dependencies.azure_identity]
+version = "*"
+optional = true
+
+[dependencies.azure_core]
+version = "*"
+optional = true
+
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.1"

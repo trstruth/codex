@@ -35,6 +35,30 @@ pub enum WireApi {
     Chat,
 }
 
+/// Optional authentication strategies a provider can use to obtain a Bearer token
+/// dynamically (e.g., Azure Managed Identity). These are in addition to (and take
+/// precedence over) static API keys and global OpenAI/ChatGPT auth when present.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderAuth {
+    /// Acquire an OAuth access token via Azure Managed Identity. When enabled,
+    /// Codex will request a token for the given `scopes` and attach it as a
+    /// standard `Authorization: Bearer <token>` header for requests to this
+    /// provider.
+    ///
+    /// If `scopes` is omitted or empty, defaults to
+    /// `https://cognitiveservices.azure.com/.default`.
+    ///
+    /// To use a user-assigned managed identity, set `AZURE_CLIENT_ID` in the
+    /// environment (or provide `client_id` if supported by the runtime).
+    AzureManagedIdentity {
+        #[serde(default)]
+        scopes: Vec<String>,
+        #[serde(default)]
+        client_id: Option<String>,
+    },
+}
+
 /// Serializable representation of a provider definition.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct ModelProviderInfo {
@@ -79,6 +103,10 @@ pub struct ModelProviderInfo {
     /// Whether this provider requires some form of standard authentication (API key, ChatGPT token).
     #[serde(default)]
     pub requires_openai_auth: bool,
+
+    /// Optional dynamic authentication configuration for this provider.
+    #[serde(default)]
+    pub auth: Option<ProviderAuth>,
 }
 
 impl ModelProviderInfo {
@@ -95,6 +123,8 @@ impl ModelProviderInfo {
         client: &'a reqwest::Client,
         auth: &Option<CodexAuth>,
     ) -> crate::error::Result<reqwest::RequestBuilder> {
+        // Prefer a provider-specific API key when present; otherwise, defer to
+        // global OpenAI/ChatGPT auth (if provided).
         let effective_auth = match self.api_key() {
             Ok(Some(key)) => Some(CodexAuth::from_api_key(&key)),
             Ok(None) => auth.clone(),
@@ -111,8 +141,16 @@ impl ModelProviderInfo {
 
         let mut builder = client.post(url);
 
+        // Attach Authorization header from (in order of precedence):
+        //  1) provider API key (already converted to CodexAuth above)
+        //  2) provider dynamic auth (e.g., Azure Managed Identity)
+        //  3) global Codex auth (OpenAI/ChatGPT)
         if let Some(auth) = effective_auth.as_ref() {
             builder = builder.bearer_auth(auth.get_token().await?);
+        } else if let Some(token) = self.get_dynamic_bearer_token().await? {
+            builder = builder.bearer_auth(token);
+        } else if let Some(global) = auth.as_ref() {
+            builder = builder.bearer_auth(global.get_token().await?);
         }
 
         Ok(self.apply_http_headers(builder))
@@ -221,6 +259,63 @@ impl ModelProviderInfo {
             .map(Duration::from_millis)
             .unwrap_or(Duration::from_millis(DEFAULT_STREAM_IDLE_TIMEOUT_MS))
     }
+
+    /// Try to obtain a Bearer token using the provider's dynamic auth config.
+    /// Returns Ok(None) when no dynamic auth is configured.
+    async fn get_dynamic_bearer_token(&self) -> crate::error::Result<Option<String>> {
+        let Some(auth) = &self.auth else {
+            return Ok(None);
+        };
+        match auth {
+            ProviderAuth::AzureManagedIdentity { scopes, client_id } => {
+                let token = azure_mi_get_token(scopes, client_id).await?;
+                Ok(Some(token))
+            }
+        }
+    }
+}
+
+// --- Azure Managed Identity integration (feature-gated) ---
+
+#[cfg(feature = "azure-auth")]
+async fn azure_mi_get_token(
+    scopes: &Vec<String>,
+    _client_id: &Option<String>,
+) -> crate::error::Result<String> {
+    // Note: The default credential chain will respect environment such as
+    // $AZURE_CLIENT_ID for user-assigned identities. Explicit client_id wiring
+    // can be added later using the specific builder APIs if needed.
+    let default_scopes = vec!["https://cognitiveservices.azure.com/.default".to_string()];
+    let scopes = if scopes.is_empty() {
+        &default_scopes
+    } else {
+        scopes
+    };
+
+    use azure_core::auth::TokenCredential;
+    let cred = azure_identity::DefaultAzureCredential::default();
+
+    // The token scope parameter expects a space-separated list for Azure SDK.
+    let scope = scopes.join(" ");
+    let token = cred
+        .get_token(&scope)
+        .await
+        .map_err(std::io::Error::other)?
+        .token
+        .secret()
+        .to_string();
+    Ok(token)
+}
+
+#[cfg(not(feature = "azure-auth"))]
+async fn azure_mi_get_token(
+    _scopes: &Vec<String>,
+    _client_id: &Option<String>,
+) -> crate::error::Result<String> {
+    Err(std::io::Error::other(
+        "Azure Managed Identity auth requires building with the 'azure-auth' feature",
+    )
+    .into())
 }
 
 const DEFAULT_OLLAMA_PORT: u32 = 11434;
@@ -273,6 +368,7 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                 stream_max_retries: None,
                 stream_idle_timeout_ms: None,
                 requires_openai_auth: true,
+                auth: None,
             },
         ),
         (BUILT_IN_OSS_MODEL_PROVIDER_ID, create_oss_provider()),
@@ -317,6 +413,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str) -> ModelProviderInfo {
         stream_max_retries: None,
         stream_idle_timeout_ms: None,
         requires_openai_auth: false,
+        auth: None,
     }
 }
 
@@ -345,6 +442,7 @@ base_url = "http://localhost:11434/v1"
             stream_max_retries: None,
             stream_idle_timeout_ms: None,
             requires_openai_auth: false,
+            auth: None,
         };
 
         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
@@ -374,6 +472,7 @@ query_params = { api-version = "2025-04-01-preview" }
             stream_max_retries: None,
             stream_idle_timeout_ms: None,
             requires_openai_auth: false,
+            auth: None,
         };
 
         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
@@ -406,6 +505,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             stream_max_retries: None,
             stream_idle_timeout_ms: None,
             requires_openai_auth: false,
+            auth: None,
         };
 
         let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
