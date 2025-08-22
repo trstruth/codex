@@ -1,0 +1,34 @@
+# Example configuration for using Azure OpenAI with Managed Identity (MSI)
+
+# Choose a profile below when launching Codex, e.g.:
+#   codex --profile azure-msi-chat
+
+[model_providers.azure-msi-chat]
+name = "Azure via MSI (Chat)"
+# IMPORTANT: include your deployment in the base_url for Chat Completions
+base_url = "https://YOUR_RESOURCE.openai.azure.com/openai/deployments/YOUR_DEPLOYMENT"
+wire_api = "chat"
+query_params = { api-version = "2025-04-01-preview" }
+
+# Dynamic auth via Azure Managed Identity.
+# For user-assigned MI, either set `client_id` here or export AZURE_CLIENT_ID.
+auth = { type = "azure_managed_identity", client_id = "YOUR-CLIENT-ID" }
+
+[profiles.azure-msi-chat]
+# Use a suitable model slug for your deployment
+model = "gpt-4o"
+model_provider = "azure-msi-chat"
+
+
+# Optional: Responses API variant (only if your Azure endpoint supports Responses)
+[model_providers.azure-msi-responses]
+name = "Azure via MSI (Responses)"
+base_url = "https://YOUR_RESOURCE.openai.azure.com/openai"
+wire_api = "responses"
+query_params = { api-version = "2025-04-01-preview" }
+auth = { type = "azure_managed_identity" }
+
+[profiles.azure-msi-responses]
+model = "o3"
+model_provider = "azure-msi-responses"
+

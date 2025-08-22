@@ -123,34 +123,33 @@ impl ModelProviderInfo {
         client: &'a reqwest::Client,
         auth: &Option<CodexAuth>,
     ) -> crate::error::Result<reqwest::RequestBuilder> {
-        // Prefer a provider-specific API key when present; otherwise, defer to
-        // global OpenAI/ChatGPT auth (if provided).
-        let effective_auth = match self.api_key() {
-            Ok(Some(key)) => Some(CodexAuth::from_api_key(&key)),
-            Ok(None) => auth.clone(),
-            Err(err) => {
-                if auth.is_some() {
-                    auth.clone()
-                } else {
-                    return Err(err);
-                }
-            }
+        // Build the target URL first – it may depend on auth mode (ChatGPT vs OpenAI).
+        // We will resolve the Authorization header separately with the proper precedence.
+        let url = self.get_full_url(auth);
+
+        // Determine Authorization header with the following precedence:
+        //   1) Dynamic provider auth (e.g., Azure Managed Identity)
+        //   2) Provider-specific API key from env
+        //   3) Global Codex auth (OpenAI/ChatGPT)
+        let bearer: Option<String> = match self.get_dynamic_bearer_token().await? {
+            Some(token) => Some(token),
+            None => match self.api_key() {
+                Ok(Some(key)) => Some(key),
+                Ok(None) => match auth.as_ref() {
+                    Some(global) => Some(global.get_token().await?),
+                    None => None,
+                },
+                // If an env key is required but missing, fall back to global auth when available.
+                Err(err) => match auth.as_ref() {
+                    Some(global) => Some(global.get_token().await?),
+                    None => return Err(err),
+                },
+            },
         };
 
-        let url = self.get_full_url(&effective_auth);
-
         let mut builder = client.post(url);
-
-        // Attach Authorization header from (in order of precedence):
-        //  1) provider API key (already converted to CodexAuth above)
-        //  2) provider dynamic auth (e.g., Azure Managed Identity)
-        //  3) global Codex auth (OpenAI/ChatGPT)
-        if let Some(auth) = effective_auth.as_ref() {
-            builder = builder.bearer_auth(auth.get_token().await?);
-        } else if let Some(token) = self.get_dynamic_bearer_token().await? {
-            builder = builder.bearer_auth(token);
-        } else if let Some(global) = auth.as_ref() {
-            builder = builder.bearer_auth(global.get_token().await?);
+        if let Some(bearer) = bearer {
+            builder = builder.bearer_auth(bearer);
         }
 
         Ok(self.apply_http_headers(builder))
@@ -280,7 +279,7 @@ impl ModelProviderInfo {
 #[cfg(feature = "azure-auth")]
 async fn azure_mi_get_token(
     scopes: &Vec<String>,
-    _client_id: &Option<String>,
+    client_id: &Option<String>,
 ) -> crate::error::Result<String> {
     // Note: The default credential chain will respect environment such as
     // $AZURE_CLIENT_ID for user-assigned identities. Explicit client_id wiring
@@ -292,13 +291,27 @@ async fn azure_mi_get_token(
         scopes
     };
 
-    use azure_core::auth::TokenCredential;
-    let cred = azure_identity::DefaultAzureCredential::default();
+    use azure_core::credentials::{TokenCredential, TokenRequestOptions};
+    use azure_identity::{
+        ManagedIdentityCredential, ManagedIdentityCredentialOptions, UserAssignedId,
+    };
 
-    // The token scope parameter expects a space-separated list for Azure SDK.
-    let scope = scopes.join(" ");
+    // Use Managed Identity directly, optionally with a user-assigned client ID from config.
+    let mut options = ManagedIdentityCredentialOptions::default();
+    if let Some(cid) = client_id.as_ref() {
+        options.user_assigned_id = Some(UserAssignedId::ClientId(cid.clone()));
+    }
+    let cred = ManagedIdentityCredential::new(Some(options)).map_err(std::io::Error::other)?;
+
+    // Managed Identity requires exactly one scope.
+    let scope: &str = if scopes.is_empty() {
+        "https://cognitiveservices.azure.com/.default"
+    } else {
+        scopes[0].as_str()
+    };
+
     let token = cred
-        .get_token(&scope)
+        .get_token(&[scope], Some(TokenRequestOptions::default()))
         .await
         .map_err(std::io::Error::other)?
         .token

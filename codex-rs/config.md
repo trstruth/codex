@@ -76,6 +76,44 @@ env_key = "AZURE_OPENAI_API_KEY"  # Or "OPENAI_API_KEY", whichever you use.
 query_params = { api-version = "2025-04-01-preview" }
 ```
 
+### Azure managed identity (MSI)
+
+Codex can acquire a Bearer token via Azure Managed Identity and attach it to requests to your Azure endpoint. Use the `auth` block on a provider, and omit `env_key` (which would enforce a static API key):
+
+```toml
+[model_providers.azure-msi]
+name = "Azure via MSI"
+base_url = "https://YOUR_PROJECT_NAME.openai.azure.com/openai"
+wire_api = "responses"  # or "chat" depending on your Azure deployment
+query_params = { api-version = "2025-04-01-preview" }
+
+# Dynamic auth: get token from Azure Managed Identity and set Authorization: Bearer <token>
+auth = { type = "azure_managed_identity", scopes = ["https://cognitiveservices.azure.com/.default"], client_id = "YOUR-USER-ASSIGNED-CLIENT-ID" }
+```
+
+Notes:
+
+- By default, the scope `https://cognitiveservices.azure.com/.default` is used when `scopes` is omitted.
+- For user‑assigned identities, either set `client_id` in the `auth` block as shown above, or set `AZURE_CLIENT_ID` in the environment before launching Codex. If both are provided, the environment variable wins.
+- If you prefer providing your own token, you can skip `auth` and instead set a header from an env var via `env_http_headers = { "Authorization" = "AZURE_ACCESS_TOKEN" }`.
+- Building MSI support requires compiling with the `azure-auth` Cargo feature. The prebuilt binaries may or may not include it; when building locally, enable with `--features azure-auth` in the `codex-core` crate.
+
+Build tips:
+
+- To build the CLI with MSI enabled: `cargo build -p codex-cli --features azure-auth`
+- Or enable it when running via `just`: `cargo run -p codex-cli --features azure-auth -- <args>`
+
+Chat Completions on Azure require including the deployment segment in the base URL. For example:
+
+```toml
+[model_providers.azure-msi-chat]
+name = "Azure via MSI (Chat)"
+base_url = "https://YOUR_RESOURCE.openai.azure.com/openai/deployments/YOUR_DEPLOYMENT"
+wire_api = "chat"
+query_params = { api-version = "2025-04-01-preview" }
+auth = { type = "azure_managed_identity" }
+```
+
 It is also possible to configure a provider to include extra HTTP headers with a request. These can be hardcoded values (`http_headers`) or values read from environment variables (`env_http_headers`):
 
 ```toml

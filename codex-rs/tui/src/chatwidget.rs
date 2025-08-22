@@ -311,11 +311,26 @@ impl ChatWidget<'_> {
 
                 self.request_redraw();
             }
-            EventMsg::AgentMessage(AgentMessageEvent { message: _ }) => {
-                // Final assistant answer: commit all remaining rows and close with
-                // a blank line. Use the final text if provided, otherwise rely on
-                // streamed deltas already in the builder.
-                self.finalize_stream(StreamKind::Answer);
+            EventMsg::AgentMessage(AgentMessageEvent { message }) => {
+                // Final assistant answer. If we have an active Answer stream
+                // (deltas were received), finalize it. Otherwise, emit the
+                // completed message directly so providers that only send a
+                // final message (e.g., aggregated chat mode) still render.
+                if self.current_stream == Some(StreamKind::Answer) {
+                    self.finalize_stream(StreamKind::Answer);
+                } else {
+                    use ratatui::text::Line as RLine;
+                    // Emit a header and the final text with a trailing blank line.
+                    let mut lines: Vec<RLine> = Vec::new();
+                    lines.push(RLine::from("codex".magenta().bold()));
+                    if !message.is_empty() {
+                        for row in message.split('\n') {
+                            lines.push(RLine::from(row.to_string()));
+                        }
+                    }
+                    lines.push(RLine::from(""));
+                    self.app_event_tx.send(AppEvent::InsertHistory(lines));
+                }
                 self.request_redraw();
             }
             EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
@@ -332,9 +347,23 @@ impl ChatWidget<'_> {
                 self.stream_push_and_maybe_commit(&delta);
                 self.request_redraw();
             }
-            EventMsg::AgentReasoning(AgentReasoningEvent { text: _ }) => {
-                // Final reasoning: commit remaining rows and close with a blank.
-                self.finalize_stream(StreamKind::Reasoning);
+            EventMsg::AgentReasoning(AgentReasoningEvent { text }) => {
+                // Final reasoning. If we have an active Reasoning stream,
+                // finalize it; otherwise emit the completed text directly.
+                if self.current_stream == Some(StreamKind::Reasoning) {
+                    self.finalize_stream(StreamKind::Reasoning);
+                } else {
+                    use ratatui::text::Line as RLine;
+                    let mut lines: Vec<RLine> = Vec::new();
+                    lines.push(RLine::from("thinking".magenta().italic()));
+                    if !text.is_empty() {
+                        for row in text.split('\n') {
+                            lines.push(RLine::from(row.to_string()));
+                        }
+                    }
+                    lines.push(RLine::from(""));
+                    self.app_event_tx.send(AppEvent::InsertHistory(lines));
+                }
                 self.request_redraw();
             }
             EventMsg::AgentReasoningRawContentDelta(AgentReasoningRawContentDeltaEvent {
@@ -346,9 +375,23 @@ impl ChatWidget<'_> {
                 self.stream_push_and_maybe_commit(&delta);
                 self.request_redraw();
             }
-            EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text: _ }) => {
-                // Finalize the raw reasoning stream just like the summarized reasoning event.
-                self.finalize_stream(StreamKind::Reasoning);
+            EventMsg::AgentReasoningRawContent(AgentReasoningRawContentEvent { text }) => {
+                // Final raw reasoning content. Follow the same behavior as
+                // summarized reasoning events.
+                if self.current_stream == Some(StreamKind::Reasoning) {
+                    self.finalize_stream(StreamKind::Reasoning);
+                } else {
+                    use ratatui::text::Line as RLine;
+                    let mut lines: Vec<RLine> = Vec::new();
+                    lines.push(RLine::from("thinking".magenta().italic()));
+                    if !text.is_empty() {
+                        for row in text.split('\n') {
+                            lines.push(RLine::from(row.to_string()));
+                        }
+                    }
+                    lines.push(RLine::from(""));
+                    self.app_event_tx.send(AppEvent::InsertHistory(lines));
+                }
                 self.request_redraw();
             }
             EventMsg::TaskStarted => {

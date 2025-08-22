@@ -107,7 +107,9 @@ pub async fn run_main(
         base_instructions: None,
         include_plan_tool: Some(true),
         disable_response_storage: cli.oss.then_some(true),
-        show_raw_agent_reasoning: cli.oss.then_some(true),
+        // Force streaming mode in the TUI so assistant answers and reasoning
+        // render live even when providers aggregate chat output.
+        show_raw_agent_reasoning: Some(true),
     };
 
     // Parse `-c` overrides from the CLI.
