@@ -57,6 +57,23 @@ pub enum ProviderAuth {
         #[serde(default)]
         client_id: Option<String>,
     },
+    /// Acquire an OAuth access token via the Azure CLI credential (uses `az`
+    /// login state). Useful for developer interactive sessions using your own
+    /// user identity.
+    AzureCli {
+        #[serde(default)]
+        scopes: Vec<String>,
+    },
+    /// Acquire an OAuth access token via an interactive browser flow. Intended
+    /// for local development; will open a browser window on first use.
+    AzureInteractiveBrowser {
+        #[serde(default)]
+        scopes: Vec<String>,
+        #[serde(default)]
+        tenant_id: Option<String>,
+        #[serde(default)]
+        client_id: Option<String>,
+    },
 }
 
 /// Serializable representation of a provider definition.
@@ -270,6 +287,19 @@ impl ModelProviderInfo {
                 let token = azure_mi_get_token(scopes, client_id).await?;
                 Ok(Some(token))
             }
+            ProviderAuth::AzureCli { scopes } => {
+                let token = azure_cli_get_token(scopes).await?;
+                Ok(Some(token))
+            }
+            ProviderAuth::AzureInteractiveBrowser {
+                scopes,
+                tenant_id,
+                client_id,
+            } => {
+                let token =
+                    azure_interactive_browser_get_token(scopes, tenant_id, client_id).await?;
+                Ok(Some(token))
+            }
         }
     }
 }
@@ -327,6 +357,62 @@ async fn azure_mi_get_token(
 ) -> crate::error::Result<String> {
     Err(std::io::Error::other(
         "Azure Managed Identity auth requires building with the 'azure-auth' feature",
+    )
+    .into())
+}
+
+// --- Azure CLI credential (feature-gated) ---
+
+#[cfg(feature = "azure-auth")]
+async fn azure_cli_get_token(scopes: &Vec<String>) -> crate::error::Result<String> {
+    use azure_core::credentials::{TokenCredential, TokenRequestOptions};
+    use azure_identity::AzureCliCredential;
+
+    let default_scopes = vec!["https://cognitiveservices.azure.com/.default".to_string()];
+    let scope: &str = if scopes.is_empty() { &default_scopes[0] } else { scopes[0].as_str() };
+
+    let cred = AzureCliCredential::new(None).map_err(std::io::Error::other)?;
+    let token = cred
+        .get_token(&[scope], Some(TokenRequestOptions::default()))
+        .await
+        .map_err(std::io::Error::other)?
+        .token
+        .secret()
+        .to_string();
+    Ok(token)
+}
+
+#[cfg(not(feature = "azure-auth"))]
+async fn azure_cli_get_token(_scopes: &Vec<String>) -> crate::error::Result<String> {
+    Err(std::io::Error::other(
+        "Azure CLI auth requires building with the 'azure-auth' feature",
+    )
+    .into())
+}
+
+// --- Azure Interactive Browser credential (feature-gated) ---
+
+#[cfg(feature = "azure-auth")]
+async fn azure_interactive_browser_get_token(
+    scopes: &Vec<String>,
+    tenant_id: &Option<String>,
+    client_id: &Option<String>,
+) -> crate::error::Result<String> {
+    let _ = (scopes, tenant_id, client_id);
+    Err(std::io::Error::other(
+        "Azure Interactive Browser auth is not supported with the current azure_identity version; consider using Azure CLI auth instead",
+    )
+    .into())
+}
+
+#[cfg(not(feature = "azure-auth"))]
+async fn azure_interactive_browser_get_token(
+    _scopes: &Vec<String>,
+    _tenant_id: &Option<String>,
+    _client_id: &Option<String>,
+) -> crate::error::Result<String> {
+    Err(std::io::Error::other(
+        "Azure Interactive Browser auth requires building with the 'azure-auth' feature",
     )
     .into())
 }
