@@ -107,6 +107,38 @@ query_params = { api-version = "2025-04-01-preview" }
 auth = { type = "azure_managed_identity" }
 ```
 
+### Azure CLI and Interactive Browser
+
+For local development using your own identity, you can let Codex acquire tokens via Azure CLI or an interactive browser flow. These modes also attach `Authorization: Bearer <token>` to requests. As with MSI, omit `env_key`.
+
+Azure CLI (uses `az login` state):
+
+```toml
+[model_providers.azure-cli]
+name = "Azure via Azure CLI"
+base_url = "https://YOUR_RESOURCE.openai.azure.com/openai"
+wire_api = "responses"
+query_params = { api-version = "2025-04-01-preview" }
+auth = { type = "azure_cli" }
+```
+
+Interactive Browser (opens a browser window when needed):
+
+```toml
+[model_providers.azure-interactive]
+name = "Azure via Interactive Browser"
+base_url = "https://YOUR_RESOURCE.openai.azure.com/openai"
+wire_api = "responses"
+query_params = { api-version = "2025-04-01-preview" }
+# tenant_id/client_id are optional; defaults are fine for most cases
+auth = { type = "azure_interactive_browser" }
+```
+
+Notes:
+- Default scope is `https://cognitiveservices.azure.com/.default` if `scopes` is omitted.
+- These modes require building with the `azure-auth` Cargo feature, same as MSI.
+- You can set custom scopes: `auth = { type = "azure_cli", scopes = ["https://cognitiveservices.azure.com/.default"] }`.
+
 It is also possible to configure a provider to include extra HTTP headers with a request. These can be hardcoded values (`http_headers`) or values read from environment variables (`env_http_headers`):
 
 ```toml
