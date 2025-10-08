@@ -76,7 +76,12 @@ pub enum HistoryPersistence {
 
 /// Collection of settings that are specific to the TUI.
 #[derive(Deserialize, Debug, Clone, PartialEq, Default)]
-pub struct Tui {}
+pub struct Tui {
+    /// If set, use this fixed column width for wrapping and truncation in the
+    /// TUI, instead of the dynamic pane width. Useful to make copy/pastes
+    /// friendlier by avoiding hard wraps at small widths.
+    pub wrap_columns: Option<u16>,
+}
 
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Default, Serialize)]
 #[serde(rename_all = "kebab-case")]

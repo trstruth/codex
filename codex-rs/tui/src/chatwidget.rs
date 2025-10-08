@@ -76,6 +76,8 @@ pub(crate) struct ChatWidget<'a> {
     answer_buffer: String,
     running_commands: HashMap<String, RunningCommand>,
     live_builder: RowBuilder,
+    // Last known terminal width used for wrapping/truncation.
+    last_known_wrap_width: u16,
     current_stream: Option<StreamKind>,
     stream_header_emitted: bool,
     live_max_rows: u16,
@@ -126,7 +128,7 @@ impl ChatWidget<'_> {
             self.request_redraw();
         }
     }
-    fn layout_areas(&self, area: Rect) -> [Rect; 2] {
+    pub(crate) fn layout_areas(&self, area: Rect) -> [Rect; 2] {
         Layout::vertical([
             Constraint::Max(
                 self.active_history_cell
@@ -221,6 +223,7 @@ impl ChatWidget<'_> {
             answer_buffer: String::new(),
             running_commands: HashMap::new(),
             live_builder: RowBuilder::new(80),
+            last_known_wrap_width: 80,
             current_stream: None,
             stream_header_emitted: false,
             live_max_rows: 3,
@@ -549,8 +552,9 @@ impl ChatWidget<'_> {
                 invocation,
                 result,
             }) => {
+                // Use current wrap width for truncation approximation.
                 self.add_to_history(HistoryCell::new_completed_mcp_tool_call(
-                    80,
+                    self.last_known_wrap_width,
                     invocation,
                     duration,
                     result
@@ -690,7 +694,7 @@ impl ChatWidget<'_> {
             self.current_stream = Some(kind);
             self.stream_header_emitted = false;
             // Clear any previous live content; we're starting a new stream.
-            self.live_builder = RowBuilder::new(self.live_builder.width());
+            self.live_builder = RowBuilder::new(self.last_known_wrap_width as usize);
             // Ensure the waiting status is visible (composer replaced).
             self.bottom_pane
                 .update_status_text("waiting for model".to_string());
@@ -769,7 +773,7 @@ impl ChatWidget<'_> {
         }
 
         // Clear the live overlay and reset state for the next stream.
-        self.live_builder = RowBuilder::new(self.live_builder.width());
+        self.live_builder = RowBuilder::new(self.last_known_wrap_width as usize);
         self.bottom_pane.clear_live_ring();
         self.current_stream = None;
         self.stream_header_emitted = false;
@@ -779,9 +783,25 @@ impl ChatWidget<'_> {
 impl WidgetRef for &ChatWidget<'_> {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
         let [active_cell_area, bottom_pane_area] = self.layout_areas(area);
+        // Update wrapping width based on the current bottom pane width.
+        // Note: render_ref has &self, so we pass width along via an AppEvent
+        // driven path elsewhere. For now we store it in a Cell-like field by
+        // keeping last_known_wrap_width mutable in other code paths.
         (&self.bottom_pane).render(bottom_pane_area, buf);
         if let Some(cell) = &self.active_history_cell {
             cell.render_ref(active_cell_area, buf);
+        }
+    }
+}
+
+impl ChatWidget<'_> {
+    /// Update the wrap width used by live streaming rows and truncation helpers.
+    /// Rewraps any buffered live content to match the new width.
+    pub(crate) fn update_wrap_width(&mut self, width: u16) {
+        let width = width.max(1);
+        if self.last_known_wrap_width != width {
+            self.last_known_wrap_width = width;
+            self.live_builder.set_width(width as usize);
         }
     }
 }

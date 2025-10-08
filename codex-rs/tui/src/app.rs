@@ -496,6 +496,16 @@ impl App<'_> {
         }
         terminal.draw(|frame| match &mut self.app_state {
             AppState::Chat { widget } => {
+                // Keep ChatWidget informed of current pane width so it can
+                // wrap live content appropriately. Allow config override via
+                // `config.tui.wrap_columns` when set.
+                let [_, bottom_pane_area] = widget.layout_areas(frame.area());
+                let wrap_cols = if let Some(cols) = self.config.tui.wrap_columns {
+                    cols
+                } else {
+                    bottom_pane_area.width
+                };
+                widget.update_wrap_width(wrap_cols);
                 if let Some((x, y)) = widget.cursor_pos(frame.area()) {
                     frame.set_cursor_position((x, y));
                 }
