@@ -1,16 +1,9 @@
-# Config
+# Configuration docs moved
 
-Codex supports several mechanisms for setting config values:
+This file has moved. Please see the latest configuration documentation here:
 
-- Config-specific command-line flags, such as `--model o3` (highest precedence).
-- A generic `-c`/`--config` flag that takes a `key=value` pair, such as `--config model="o3"`.
-  - The key can contain dots to set a value deeper than the root, e.g. `--config model_providers.openai.wire_api="chat"`.
-  - Values can contain objects, such as `--config shell_environment_policy.include_only=["PATH", "HOME", "USER"]`.
-  - For consistency with `config.toml`, values are in TOML format rather than JSON format, so use `{a = 1, b = 2}` rather than `{"a": 1, "b": 2}`.
-  - If `value` cannot be parsed as a valid TOML value, it is treated as a string value. This means that both `-c model="o3"` and `-c model=o3` are equivalent.
-- The `$CODEX_HOME/config.toml` configuration file where the `CODEX_HOME` environment value defaults to `~/.codex`. (Note `CODEX_HOME` will also be where logs and other Codex-related information are stored.)
-
-Both the `--config` flag and the `config.toml` file support the following options:
+- Full config docs: [docs/config.md](../docs/config.md)
+- MCP servers section: [docs/config.md#mcp_servers](../docs/config.md#mcp_servers) 
 
 ## model
 
