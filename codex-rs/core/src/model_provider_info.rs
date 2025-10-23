@@ -94,6 +94,11 @@ pub struct ModelProviderInfo {
     /// variable and set it.
     pub env_key_instructions: Option<String>,
 
+    /// Value to use with `Authorization: Bearer <token>` header. Use of this
+    /// config is discouraged in favor of `env_key` for security reasons, but
+    /// this may be necessary when using this programmatically.
+    pub experimental_bearer_token: Option<String>,
+
     /// Which wire protocol this provider expects.
     #[serde(default)]
     pub wire_api: WireApi,
@@ -152,23 +157,28 @@ impl ModelProviderInfo {
         let url = self.get_full_url(auth);
 
         // Determine Authorization header with the following precedence:
-        //   1) Dynamic provider auth (e.g., Azure Managed Identity)
-        //   2) Provider-specific API key from env
-        //   3) Global Codex auth (OpenAI/ChatGPT)
-        let bearer: Option<String> = match self.get_dynamic_bearer_token().await? {
-            Some(token) => Some(token),
-            None => match self.api_key() {
-                Ok(Some(key)) => Some(key),
-                Ok(None) => match auth.as_ref() {
-                    Some(global) => Some(global.get_token().await?),
-                    None => None,
+        //   1) Explicit experimental bearer token (unsafe; overrides all)
+        //   2) Dynamic provider auth (e.g., Azure Managed Identity)
+        //   3) Provider-specific API key from env
+        //   4) Global Codex auth (OpenAI/ChatGPT)
+        let bearer: Option<String> = if let Some(secret_key) = &self.experimental_bearer_token {
+            Some(secret_key.clone())
+        } else {
+            match self.get_dynamic_bearer_token().await? {
+                Some(token) => Some(token),
+                None => match self.api_key() {
+                    Ok(Some(key)) => Some(key),
+                    Ok(None) => match auth.as_ref() {
+                        Some(global) => Some(global.get_token().await?),
+                        None => None,
+                    },
+                    // If an env key is required but missing, fall back to global auth when available.
+                    Err(err) => match auth.as_ref() {
+                        Some(global) => Some(global.get_token().await?),
+                        None => return Err(err),
+                    },
                 },
-                // If an env key is required but missing, fall back to global auth when available.
-                Err(err) => match auth.as_ref() {
-                    Some(global) => Some(global.get_token().await?),
-                    None => return Err(err),
-                },
-            },
+            }
         };
 
         let mut builder = client.post(url);
@@ -345,10 +355,11 @@ async fn azure_mi_get_token(
         scopes
     };
 
-    use azure_core::credentials::{TokenCredential, TokenRequestOptions};
-    use azure_identity::{
-        ManagedIdentityCredential, ManagedIdentityCredentialOptions, UserAssignedId,
-    };
+    use azure_core::credentials::TokenCredential;
+    use azure_core::credentials::TokenRequestOptions;
+    use azure_identity::ManagedIdentityCredential;
+    use azure_identity::ManagedIdentityCredentialOptions;
+    use azure_identity::UserAssignedId;
 
     // Use Managed Identity directly, optionally with a user-assigned client ID from config.
     let mut options = ManagedIdentityCredentialOptions::default();
@@ -389,11 +400,16 @@ async fn azure_mi_get_token(
 
 #[cfg(feature = "azure-auth")]
 async fn azure_cli_get_token(scopes: &Vec<String>) -> crate::error::Result<String> {
-    use azure_core::credentials::{TokenCredential, TokenRequestOptions};
+    use azure_core::credentials::TokenCredential;
+    use azure_core::credentials::TokenRequestOptions;
     use azure_identity::AzureCliCredential;
 
     let default_scopes = vec!["https://cognitiveservices.azure.com/.default".to_string()];
-    let scope: &str = if scopes.is_empty() { &default_scopes[0] } else { scopes[0].as_str() };
+    let scope: &str = if scopes.is_empty() {
+        &default_scopes[0]
+    } else {
+        scopes[0].as_str()
+    };
 
     let cred = AzureCliCredential::new(None).map_err(std::io::Error::other)?;
     let token = cred
@@ -408,10 +424,10 @@ async fn azure_cli_get_token(scopes: &Vec<String>) -> crate::error::Result<Strin
 
 #[cfg(not(feature = "azure-auth"))]
 async fn azure_cli_get_token(_scopes: &Vec<String>) -> crate::error::Result<String> {
-    Err(std::io::Error::other(
-        "Azure CLI auth requires building with the 'azure-auth' feature",
+    Err(
+        std::io::Error::other("Azure CLI auth requires building with the 'azure-auth' feature")
+            .into(),
     )
-    .into())
 }
 
 // --- Azure Interactive Browser credential (feature-gated) ---
@@ -468,6 +484,7 @@ pub fn built_in_model_providers() -> HashMap<String, ModelProviderInfo> {
                     .filter(|v| !v.trim().is_empty()),
                 env_key: None,
                 env_key_instructions: None,
+                experimental_bearer_token: None,
                 wire_api: WireApi::Responses,
                 query_params: None,
                 http_headers: Some(
@@ -528,6 +545,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str) -> ModelProviderInfo {
         base_url: Some(base_url.into()),
         env_key: None,
         env_key_instructions: None,
+        experimental_bearer_token: None,
         wire_api: WireApi::Chat,
         query_params: None,
         http_headers: None,
@@ -568,6 +586,7 @@ base_url = "http://localhost:11434/v1"
             base_url: Some("http://localhost:11434/v1".into()),
             env_key: None,
             env_key_instructions: None,
+            experimental_bearer_token: None,
             wire_api: WireApi::Chat,
             query_params: None,
             http_headers: None,
@@ -596,6 +615,7 @@ query_params = { api-version = "2025-04-01-preview" }
             base_url: Some("https://xxxxx.openai.azure.com/openai".into()),
             env_key: Some("AZURE_OPENAI_API_KEY".into()),
             env_key_instructions: None,
+            experimental_bearer_token: None,
             wire_api: WireApi::Chat,
             query_params: Some(maplit::hashmap! {
                 "api-version".to_string() => "2025-04-01-preview".to_string(),
@@ -627,6 +647,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             base_url: Some("https://example.com".into()),
             env_key: Some("API_KEY".into()),
             env_key_instructions: None,
+            experimental_bearer_token: None,
             wire_api: WireApi::Chat,
             query_params: None,
             http_headers: Some(maplit::hashmap! {
@@ -654,6 +675,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
                 base_url: Some(base_url.into()),
                 env_key: None,
                 env_key_instructions: None,
+                experimental_bearer_token: None,
                 wire_api: WireApi::Responses,
                 query_params: None,
                 http_headers: None,
@@ -686,6 +708,7 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
             base_url: Some("https://example.com".into()),
             env_key: None,
             env_key_instructions: None,
+            experimental_bearer_token: None,
             wire_api: WireApi::Responses,
             query_params: None,
             http_headers: None,
