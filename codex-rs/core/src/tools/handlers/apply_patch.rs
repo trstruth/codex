@@ -42,6 +42,10 @@ impl ToolHandler for ApplyPatchHandler {
         )
     }
 
+    fn is_mutating(&self, _invocation: &ToolInvocation) -> bool {
+        true
+    }
+
     async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
         let ToolInvocation {
             session,
@@ -82,6 +86,7 @@ impl ToolHandler for ApplyPatchHandler {
                         let content = item?;
                         Ok(ToolOutput::Function {
                             content,
+                            content_items: None,
                             success: Some(true),
                         })
                     }
@@ -126,6 +131,7 @@ impl ToolHandler for ApplyPatchHandler {
                         let content = emitter.finish(event_ctx, out).await?;
                         Ok(ToolOutput::Function {
                             content,
+                            content_items: None,
                             success: Some(true),
                         })
                     }

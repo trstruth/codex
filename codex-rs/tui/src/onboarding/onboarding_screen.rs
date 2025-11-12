@@ -57,6 +57,7 @@ pub(crate) struct OnboardingScreen {
     steps: Vec<Step>,
     is_done: bool,
     windows_install_selected: bool,
+    should_exit: bool,
 }
 
 pub(crate) struct OnboardingScreenArgs {
@@ -71,6 +72,7 @@ pub(crate) struct OnboardingScreenArgs {
 pub(crate) struct OnboardingResult {
     pub directory_trust_decision: Option<TrustDirectorySelection>,
     pub windows_install_selected: bool,
+    pub should_exit: bool,
 }
 
 impl OnboardingScreen {
@@ -87,6 +89,7 @@ impl OnboardingScreen {
         let forced_chatgpt_workspace_id = config.forced_chatgpt_workspace_id.clone();
         let forced_login_method = config.forced_login_method;
         let codex_home = config.codex_home;
+        let cli_auth_credentials_store_mode = config.cli_auth_credentials_store_mode;
         let mut steps: Vec<Step> = Vec::new();
         if show_windows_wsl_screen {
             steps.push(Step::Windows(WindowsSetupWidget::new(codex_home.clone())));
@@ -106,6 +109,7 @@ impl OnboardingScreen {
                 error: None,
                 sign_in_state: Arc::new(RwLock::new(SignInState::PickMode)),
                 codex_home: codex_home.clone(),
+                cli_auth_credentials_store_mode,
                 login_status,
                 auth_manager,
                 forced_chatgpt_workspace_id,
@@ -135,6 +139,7 @@ impl OnboardingScreen {
             steps,
             is_done: false,
             windows_install_selected: false,
+            should_exit: false,
         }
     }
 
@@ -168,6 +173,12 @@ impl OnboardingScreen {
         out
     }
 
+    fn is_auth_in_progress(&self) -> bool {
+        self.steps.iter().any(|step| {
+            matches!(step, Step::Auth(_)) && matches!(step.get_step_state(), StepState::InProgress)
+        })
+    }
+
     pub(crate) fn is_done(&self) -> bool {
         self.is_done
             || !self
@@ -192,6 +203,10 @@ impl OnboardingScreen {
     pub fn windows_install_selected(&self) -> bool {
         self.windows_install_selected
     }
+
+    pub fn should_exit(&self) -> bool {
+        self.should_exit
+    }
 }
 
 impl KeyboardHandler for OnboardingScreen {
@@ -214,6 +229,11 @@ impl KeyboardHandler for OnboardingScreen {
                 kind: KeyEventKind::Press,
                 ..
             } => {
+                if self.is_auth_in_progress() {
+                    // If the user cancels the auth menu, exit the app rather than
+                    // leave the user at a prompt in an unauthed state.
+                    self.should_exit = true;
+                }
                 self.is_done = true;
             }
             _ => {
@@ -432,5 +452,6 @@ pub(crate) async fn run_onboarding_app(
     Ok(OnboardingResult {
         directory_trust_decision: onboarding_screen.directory_trust_decision(),
         windows_install_selected: onboarding_screen.windows_install_selected(),
+        should_exit: onboarding_screen.should_exit(),
     })
 }
