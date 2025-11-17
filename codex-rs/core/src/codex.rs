@@ -96,6 +96,7 @@ use crate::protocol::StreamErrorEvent;
 use crate::protocol::Submission;
 use crate::protocol::TokenCountEvent;
 use crate::protocol::TokenUsage;
+use crate::protocol::TokenUsageInfo;
 use crate::protocol::TurnDiffEvent;
 use crate::protocol::WarningEvent;
 use crate::rollout::RolloutRecorder;
@@ -132,6 +133,7 @@ use codex_protocol::protocol::InitialHistory;
 use codex_protocol::user_input::UserInput;
 use codex_utils_readiness::Readiness;
 use codex_utils_readiness::ReadinessFlag;
+use codex_utils_tokenizer::warm_model_cache;
 
 /// The high-level interface to the Codex system.
 /// It operates as a queue pair where you send submissions and receive events.
@@ -588,6 +590,9 @@ impl Session {
 
         // Create the mutable state for the Session.
         let state = SessionState::new(session_configuration.clone());
+
+        // Warm the tokenizer cache for the session model without blocking startup.
+        warm_model_cache(&session_configuration.model);
 
         let services = SessionServices {
             mcp_connection_manager,
@@ -1078,6 +1083,36 @@ impl Session {
                     turn_context.client.get_model_context_window(),
                 );
             }
+        }
+        self.send_token_count_event(turn_context).await;
+    }
+
+    pub(crate) async fn override_last_token_usage_estimate(
+        &self,
+        turn_context: &TurnContext,
+        estimated_total_tokens: i64,
+    ) {
+        {
+            let mut state = self.state.lock().await;
+            let mut info = state.token_info().unwrap_or(TokenUsageInfo {
+                total_token_usage: TokenUsage::default(),
+                last_token_usage: TokenUsage::default(),
+                model_context_window: None,
+            });
+
+            info.last_token_usage = TokenUsage {
+                input_tokens: 0,
+                cached_input_tokens: 0,
+                output_tokens: 0,
+                reasoning_output_tokens: 0,
+                total_tokens: estimated_total_tokens.max(0),
+            };
+
+            if info.model_context_window.is_none() {
+                info.model_context_window = turn_context.client.get_model_context_window();
+            }
+
+            state.set_token_info(Some(info));
         }
         self.send_token_count_event(turn_context).await;
     }
@@ -1784,7 +1819,6 @@ pub(crate) async fn run_task(
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
     let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-    let mut auto_compact_recently_attempted = false;
 
     loop {
         // Note that pending_input would be something like a message the user
@@ -1839,26 +1873,11 @@ pub(crate) async fn run_task(
                 let (responses, items_to_record_in_conversation_history) =
                     process_items(processed_items, &sess, &turn_context).await;
 
+                // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                 if token_limit_reached {
-                    if auto_compact_recently_attempted {
-                        let limit_str = limit.to_string();
-                        let current_tokens = total_usage_tokens
-                            .map(|tokens| tokens.to_string())
-                            .unwrap_or_else(|| "unknown".to_string());
-                        let event = EventMsg::Error(ErrorEvent {
-                            message: format!(
-                                "Conversation is still above the token limit after automatic summarization (limit {limit_str}, current {current_tokens}). Please start a new session or trim your input."
-                            ),
-                        });
-                        sess.send_event(&turn_context, event).await;
-                        break;
-                    }
-                    auto_compact_recently_attempted = true;
                     compact::run_inline_auto_compact_task(sess.clone(), turn_context.clone()).await;
                     continue;
                 }
-
-                auto_compact_recently_attempted = false;
 
                 if responses.is_empty() {
                     last_agent_message = get_last_assistant_message_from_turn(
@@ -2201,13 +2220,17 @@ async fn try_run_turn(
                     error_or_panic("ReasoningSummaryDelta without active item".to_string());
                 }
             }
-            ResponseEvent::ReasoningSummaryDelta(delta) => {
+            ResponseEvent::ReasoningSummaryDelta {
+                delta,
+                summary_index,
+            } => {
                 if let Some(active) = active_item.as_ref() {
                     let event = ReasoningContentDeltaEvent {
                         thread_id: sess.conversation_id.to_string(),
                         turn_id: turn_context.sub_id.clone(),
                         item_id: active.id(),
-                        delta: delta.clone(),
+                        delta,
+                        summary_index,
                     };
                     sess.send_event(&turn_context, EventMsg::ReasoningContentDelta(event))
                         .await;
@@ -2215,18 +2238,29 @@ async fn try_run_turn(
                     error_or_panic("ReasoningSummaryDelta without active item".to_string());
                 }
             }
-            ResponseEvent::ReasoningSummaryPartAdded => {
-                let event =
-                    EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {});
-                sess.send_event(&turn_context, event).await;
+            ResponseEvent::ReasoningSummaryPartAdded { summary_index } => {
+                if let Some(active) = active_item.as_ref() {
+                    let event =
+                        EventMsg::AgentReasoningSectionBreak(AgentReasoningSectionBreakEvent {
+                            item_id: active.id(),
+                            summary_index,
+                        });
+                    sess.send_event(&turn_context, event).await;
+                } else {
+                    error_or_panic("ReasoningSummaryPartAdded without active item".to_string());
+                }
             }
-            ResponseEvent::ReasoningContentDelta(delta) => {
+            ResponseEvent::ReasoningContentDelta {
+                delta,
+                content_index,
+            } => {
                 if let Some(active) = active_item.as_ref() {
                     let event = ReasoningRawContentDeltaEvent {
                         thread_id: sess.conversation_id.to_string(),
                         turn_id: turn_context.sub_id.clone(),
                         item_id: active.id(),
-                        delta: delta.clone(),
+                        delta,
+                        content_index,
                     };
                     sess.send_event(&turn_context, EventMsg::ReasoningRawContentDelta(event))
                         .await;
