@@ -4,11 +4,12 @@ use crate::Prompt;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::error::Result as CodexResult;
-use crate::protocol::AgentMessageEvent;
 use crate::protocol::CompactedItem;
 use crate::protocol::EventMsg;
 use crate::protocol::RolloutItem;
-use crate::protocol::TaskStartedEvent;
+use crate::protocol::TurnStartedEvent;
+use codex_protocol::items::ContextCompactionItem;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 
 pub(crate) async fn run_inline_remote_auto_compact_task(
@@ -19,7 +20,7 @@ pub(crate) async fn run_inline_remote_auto_compact_task(
 }
 
 pub(crate) async fn run_remote_compact_task(sess: Arc<Session>, turn_context: Arc<TurnContext>) {
-    let start_event = EventMsg::TaskStarted(TaskStartedEvent {
+    let start_event = EventMsg::TurnStarted(TurnStartedEvent {
         model_context_window: turn_context.client.get_model_context_window(),
     });
     sess.send_event(&turn_context, start_event).await;
@@ -40,12 +41,25 @@ async fn run_remote_compact_task_inner_impl(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
 ) -> CodexResult<()> {
-    let mut history = sess.clone_history().await;
+    let compaction_item = TurnItem::ContextCompaction(ContextCompactionItem::new());
+    sess.emit_turn_item_started(turn_context, &compaction_item)
+        .await;
+    let history = sess.clone_history().await;
+
+    // Required to keep `/undo` available after compaction
+    let ghost_snapshots: Vec<ResponseItem> = history
+        .raw_items()
+        .iter()
+        .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
+        .cloned()
+        .collect();
+
     let prompt = Prompt {
-        input: history.get_history_for_prompt(),
+        input: history.for_prompt(),
         tools: vec![],
         parallel_tool_calls: false,
-        base_instructions_override: turn_context.base_instructions.clone(),
+        base_instructions: sess.get_base_instructions().await,
+        personality: turn_context.personality,
         output_schema: None,
     };
 
@@ -53,13 +67,6 @@ async fn run_remote_compact_task_inner_impl(
         .client
         .compact_conversation_history(&prompt)
         .await?;
-    // Required to keep `/undo` available after compaction
-    let ghost_snapshots: Vec<ResponseItem> = history
-        .get_history()
-        .iter()
-        .filter(|item| matches!(item, ResponseItem::GhostSnapshot { .. }))
-        .cloned()
-        .collect();
 
     if !ghost_snapshots.is_empty() {
         new_history.extend(ghost_snapshots);
@@ -74,10 +81,7 @@ async fn run_remote_compact_task_inner_impl(
     sess.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
         .await;
 
-    let event = EventMsg::AgentMessage(AgentMessageEvent {
-        message: "Compact task completed".to_string(),
-    });
-    sess.send_event(turn_context, event).await;
-
+    sess.emit_turn_item_completed(turn_context, compaction_item)
+        .await;
     Ok(())
 }

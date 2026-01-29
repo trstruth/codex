@@ -6,9 +6,12 @@ use anyhow::Result;
 use codex_core::CodexAuth;
 use codex_core::features::Feature;
 use codex_core::protocol::EventMsg;
+use codex_core::protocol::ItemCompletedEvent;
+use codex_core::protocol::ItemStartedEvent;
 use codex_core::protocol::Op;
 use codex_core::protocol::RolloutItem;
 use codex_core::protocol::RolloutLine;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::user_input::UserInput;
@@ -51,13 +54,19 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
     )
     .await;
 
-    let compacted_history = vec![ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "REMOTE_COMPACTED_SUMMARY".to_string(),
-        }],
-    }];
+    let compacted_history = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "REMOTE_COMPACTED_SUMMARY".to_string(),
+            }],
+            end_turn: None,
+        },
+        ResponseItem::Compaction {
+            encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
+        },
+    ];
     let compact_mock = responses::mount_compact_json_once(
         harness.server(),
         serde_json::json!({ "output": compacted_history.clone() }),
@@ -68,22 +77,26 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "hello remote compact".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex.submit(Op::Compact).await?;
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "after compact".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let compact_request = compact_mock.single_request();
     assert_eq!(compact_request.path(), "/v1/responses/compact");
@@ -119,6 +132,10 @@ async fn remote_compact_replaces_history_for_followups() -> Result<()> {
     assert!(
         follow_up_body.contains("REMOTE_COMPACTED_SUMMARY"),
         "expected follow-up request to use compacted history"
+    );
+    assert!(
+        follow_up_body.contains("ENCRYPTED_COMPACTION_SUMMARY"),
+        "expected follow-up request to include compaction summary item"
     );
     assert!(
         !follow_up_body.contains("FIRST_REMOTE_REPLY"),
@@ -159,13 +176,19 @@ async fn remote_compact_runs_automatically() -> Result<()> {
     )
     .await;
 
-    let compacted_history = vec![ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "REMOTE_COMPACTED_SUMMARY".to_string(),
-        }],
-    }];
+    let compacted_history = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "REMOTE_COMPACTED_SUMMARY".to_string(),
+            }],
+            end_turn: None,
+        },
+        ResponseItem::Compaction {
+            encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
+        },
+    ];
     let compact_mock = responses::mount_compact_json_once(
         harness.server(),
         serde_json::json!({ "output": compacted_history.clone() }),
@@ -176,20 +199,118 @@ async fn remote_compact_runs_automatically() -> Result<()> {
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "hello remote compact".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
-    let message = wait_for_event_match(&codex, |ev| match ev {
-        EventMsg::AgentMessage(ev) => Some(ev.message.clone()),
+
+    let message = wait_for_event_match(&codex, |event| match event {
+        EventMsg::ContextCompacted(_) => Some(true),
         _ => None,
     })
     .await;
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
-
-    assert_eq!(message, "Compact task completed");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+    assert!(message);
     assert_eq!(compact_mock.requests().len(), 1);
     let follow_up_body = responses_mock.single_request().body_json().to_string();
     assert!(follow_up_body.contains("REMOTE_COMPACTED_SUMMARY"));
+    assert!(follow_up_body.contains("ENCRYPTED_COMPACTION_SUMMARY"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_manual_compact_emits_context_compaction_items() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let harness = TestCodexHarness::with_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                config.features.enable(Feature::RemoteCompaction);
+            }),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+
+    mount_sse_once(
+        harness.server(),
+        sse(vec![
+            responses::ev_assistant_message("m1", "REMOTE_REPLY"),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    let compacted_history = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: "REMOTE_COMPACTED_SUMMARY".to_string(),
+            }],
+            end_turn: None,
+        },
+        ResponseItem::Compaction {
+            encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
+        },
+    ];
+    let compact_mock = responses::mount_compact_json_once(
+        harness.server(),
+        serde_json::json!({ "output": compacted_history.clone() }),
+    )
+    .await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "manual remote compact".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+        })
+        .await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::Compact).await?;
+
+    let mut started_item = None;
+    let mut completed_item = None;
+    let mut legacy_event = false;
+    let mut saw_turn_complete = false;
+
+    while !saw_turn_complete || started_item.is_none() || completed_item.is_none() || !legacy_event
+    {
+        let event = codex.next_event().await.unwrap();
+        match event.msg {
+            EventMsg::ItemStarted(ItemStartedEvent {
+                item: TurnItem::ContextCompaction(item),
+                ..
+            }) => {
+                started_item = Some(item);
+            }
+            EventMsg::ItemCompleted(ItemCompletedEvent {
+                item: TurnItem::ContextCompaction(item),
+                ..
+            }) => {
+                completed_item = Some(item);
+            }
+            EventMsg::ContextCompacted(_) => {
+                legacy_event = true;
+            }
+            EventMsg::TurnComplete(_) => {
+                saw_turn_complete = true;
+            }
+            _ => {}
+        }
+    }
+
+    let started_item = started_item.expect("context compaction item started");
+    let completed_item = completed_item.expect("context compaction item completed");
+    assert_eq!(started_item.id, completed_item.id);
+    assert!(legacy_event);
+    assert_eq!(compact_mock.requests().len(), 1);
 
     Ok(())
 }
@@ -207,7 +328,12 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
     )
     .await?;
     let codex = harness.test().codex.clone();
-    let rollout_path = harness.test().session_configured.rollout_path.clone();
+    let rollout_path = harness
+        .test()
+        .session_configured
+        .rollout_path
+        .clone()
+        .expect("rollout path");
 
     let responses_mock = responses::mount_sse_once(
         harness.server(),
@@ -225,6 +351,10 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
             content: vec![ContentItem::InputText {
                 text: "COMPACTED_USER_SUMMARY".to_string(),
             }],
+            end_turn: None,
+        },
+        ResponseItem::Compaction {
+            encrypted_content: "ENCRYPTED_COMPACTION_SUMMARY".to_string(),
         },
         ResponseItem::Message {
             id: None,
@@ -232,6 +362,7 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
             content: vec![ContentItem::OutputText {
                 text: "COMPACTED_ASSISTANT_NOTE".to_string(),
             }],
+            end_turn: None,
         },
     ];
     let compact_mock = responses::mount_compact_json_once(
@@ -244,13 +375,15 @@ async fn remote_compact_persists_replacement_history_in_rollout() -> Result<()> 
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "needs compaction".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex.submit(Op::Compact).await?;
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex.submit(Op::Shutdown).await?;
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::ShutdownComplete)).await;

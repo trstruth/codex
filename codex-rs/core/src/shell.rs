@@ -1,6 +1,9 @@
+use crate::shell_snapshot::ShellSnapshot;
 use serde::Deserialize;
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::watch;
 
 #[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub enum ShellType {
@@ -11,10 +14,16 @@ pub enum ShellType {
     Cmd,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Shell {
     pub(crate) shell_type: ShellType,
     pub(crate) shell_path: PathBuf,
+    #[serde(
+        skip_serializing,
+        skip_deserializing,
+        default = "empty_shell_snapshot_receiver"
+    )]
+    pub(crate) shell_snapshot: watch::Receiver<Option<Arc<ShellSnapshot>>>,
 }
 
 impl Shell {
@@ -58,7 +67,25 @@ impl Shell {
             }
         }
     }
+
+    /// Return the shell snapshot if existing.
+    pub fn shell_snapshot(&self) -> Option<Arc<ShellSnapshot>> {
+        self.shell_snapshot.borrow().clone()
+    }
 }
+
+pub(crate) fn empty_shell_snapshot_receiver() -> watch::Receiver<Option<Arc<ShellSnapshot>>> {
+    let (_tx, rx) = watch::channel(None);
+    rx
+}
+
+impl PartialEq for Shell {
+    fn eq(&self, other: &Self) -> bool {
+        self.shell_type == other.shell_type && self.shell_path == other.shell_path
+    }
+}
+
+impl Eq for Shell {}
 
 #[cfg(unix)]
 fn get_user_shell_path() -> Option<PathBuf> {
@@ -134,6 +161,7 @@ fn get_zsh_shell(path: Option<&PathBuf>) -> Option<Shell> {
     shell_path.map(|shell_path| Shell {
         shell_type: ShellType::Zsh,
         shell_path,
+        shell_snapshot: empty_shell_snapshot_receiver(),
     })
 }
 
@@ -143,6 +171,7 @@ fn get_bash_shell(path: Option<&PathBuf>) -> Option<Shell> {
     shell_path.map(|shell_path| Shell {
         shell_type: ShellType::Bash,
         shell_path,
+        shell_snapshot: empty_shell_snapshot_receiver(),
     })
 }
 
@@ -152,6 +181,7 @@ fn get_sh_shell(path: Option<&PathBuf>) -> Option<Shell> {
     shell_path.map(|shell_path| Shell {
         shell_type: ShellType::Sh,
         shell_path,
+        shell_snapshot: empty_shell_snapshot_receiver(),
     })
 }
 
@@ -167,6 +197,7 @@ fn get_powershell_shell(path: Option<&PathBuf>) -> Option<Shell> {
     shell_path.map(|shell_path| Shell {
         shell_type: ShellType::PowerShell,
         shell_path,
+        shell_snapshot: empty_shell_snapshot_receiver(),
     })
 }
 
@@ -176,6 +207,7 @@ fn get_cmd_shell(path: Option<&PathBuf>) -> Option<Shell> {
     shell_path.map(|shell_path| Shell {
         shell_type: ShellType::Cmd,
         shell_path,
+        shell_snapshot: empty_shell_snapshot_receiver(),
     })
 }
 
@@ -184,11 +216,13 @@ fn ultimate_fallback_shell() -> Shell {
         Shell {
             shell_type: ShellType::Cmd,
             shell_path: PathBuf::from("cmd.exe"),
+            shell_snapshot: empty_shell_snapshot_receiver(),
         }
     } else {
         Shell {
             shell_type: ShellType::Sh,
             shell_path: PathBuf::from("/bin/sh"),
+            shell_snapshot: empty_shell_snapshot_receiver(),
         }
     }
 }
@@ -328,6 +362,7 @@ mod detect_shell_type_tests {
 #[cfg(unix)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -338,7 +373,7 @@ mod tests {
 
         let shell_path = zsh_shell.shell_path;
 
-        assert_eq!(shell_path, PathBuf::from("/bin/zsh"));
+        assert_eq!(shell_path, Path::new("/bin/zsh"));
     }
 
     #[test]
@@ -348,7 +383,7 @@ mod tests {
 
         let shell_path = zsh_shell.shell_path;
 
-        assert_eq!(shell_path, PathBuf::from("/bin/zsh"));
+        assert_eq!(shell_path, Path::new("/bin/zsh"));
     }
 
     #[test]
@@ -357,9 +392,9 @@ mod tests {
         let shell_path = bash_shell.shell_path;
 
         assert!(
-            shell_path == PathBuf::from("/bin/bash")
-                || shell_path == PathBuf::from("/usr/bin/bash")
-                || shell_path == PathBuf::from("/usr/local/bin/bash"),
+            shell_path == Path::new("/bin/bash")
+                || shell_path == Path::new("/usr/bin/bash")
+                || shell_path == Path::new("/usr/local/bin/bash"),
             "shell path: {shell_path:?}",
         );
     }
@@ -369,7 +404,7 @@ mod tests {
         let sh_shell = get_shell(ShellType::Sh, None).unwrap();
         let shell_path = sh_shell.shell_path;
         assert!(
-            shell_path == PathBuf::from("/bin/sh") || shell_path == PathBuf::from("/usr/bin/sh"),
+            shell_path == Path::new("/bin/sh") || shell_path == Path::new("/usr/bin/sh"),
             "shell path: {shell_path:?}",
         );
     }
@@ -408,6 +443,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn derive_exec_args() {
+        let test_bash_shell = Shell {
+            shell_type: ShellType::Bash,
+            shell_path: PathBuf::from("/bin/bash"),
+            shell_snapshot: empty_shell_snapshot_receiver(),
+        };
+        assert_eq!(
+            test_bash_shell.derive_exec_args("echo hello", false),
+            vec!["/bin/bash", "-c", "echo hello"]
+        );
+        assert_eq!(
+            test_bash_shell.derive_exec_args("echo hello", true),
+            vec!["/bin/bash", "-lc", "echo hello"]
+        );
+
+        let test_zsh_shell = Shell {
+            shell_type: ShellType::Zsh,
+            shell_path: PathBuf::from("/bin/zsh"),
+            shell_snapshot: empty_shell_snapshot_receiver(),
+        };
+        assert_eq!(
+            test_zsh_shell.derive_exec_args("echo hello", false),
+            vec!["/bin/zsh", "-c", "echo hello"]
+        );
+        assert_eq!(
+            test_zsh_shell.derive_exec_args("echo hello", true),
+            vec!["/bin/zsh", "-lc", "echo hello"]
+        );
+
+        let test_powershell_shell = Shell {
+            shell_type: ShellType::PowerShell,
+            shell_path: PathBuf::from("pwsh.exe"),
+            shell_snapshot: empty_shell_snapshot_receiver(),
+        };
+        assert_eq!(
+            test_powershell_shell.derive_exec_args("echo hello", false),
+            vec!["pwsh.exe", "-NoProfile", "-Command", "echo hello"]
+        );
+        assert_eq!(
+            test_powershell_shell.derive_exec_args("echo hello", true),
+            vec!["pwsh.exe", "-Command", "echo hello"]
+        );
+    }
+
     #[tokio::test]
     async fn test_current_shell_detects_zsh() {
         let shell = Command::new("sh")
@@ -423,6 +503,7 @@ mod tests {
                 Shell {
                     shell_type: ShellType::Zsh,
                     shell_path: PathBuf::from(shell_path),
+                    shell_snapshot: empty_shell_snapshot_receiver(),
                 }
             );
         }

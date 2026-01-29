@@ -6,6 +6,9 @@ use codex_core::protocol::ItemCompletedEvent;
 use codex_core::protocol::ItemStartedEvent;
 use codex_core::protocol::Op;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::WebSearchAction;
+use codex_protocol::user_input::ByteRange;
+use codex_protocol::user_input::TextElement;
 use codex_protocol::user_input::UserInput;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -16,7 +19,7 @@ use core_test_support::responses::ev_reasoning_item_added;
 use core_test_support::responses::ev_reasoning_summary_text_delta;
 use core_test_support::responses::ev_reasoning_text_delta;
 use core_test_support::responses::ev_response_created;
-use core_test_support::responses::ev_web_search_call_added;
+use core_test_support::responses::ev_web_search_call_added_partial;
 use core_test_support::responses::ev_web_search_call_done;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
@@ -38,11 +41,19 @@ async fn user_message_item_is_emitted() -> anyhow::Result<()> {
     let first_response = sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]);
     mount_sse_once(&server, first_response).await;
 
+    let text_elements = vec![TextElement::new(
+        ByteRange { start: 0, end: 6 },
+        Some("<file>".into()),
+    )];
+    let expected_input = UserInput::Text {
+        text: "please inspect sample.txt".into(),
+        text_elements: text_elements.clone(),
+    };
+
     codex
         .submit(Op::UserInput {
-            items: (vec![UserInput::Text {
-                text: "please inspect sample.txt".into(),
-            }]),
+            items: vec![expected_input.clone()],
+            final_output_json_schema: None,
         })
         .await?;
 
@@ -64,18 +75,16 @@ async fn user_message_item_is_emitted() -> anyhow::Result<()> {
     .await;
 
     assert_eq!(started_item.id, completed_item.id);
-    assert_eq!(
-        started_item.content,
-        vec![UserInput::Text {
-            text: "please inspect sample.txt".into(),
-        }]
-    );
-    assert_eq!(
-        completed_item.content,
-        vec![UserInput::Text {
-            text: "please inspect sample.txt".into(),
-        }]
-    );
+    assert_eq!(started_item.content, vec![expected_input.clone()]);
+    assert_eq!(completed_item.content, vec![expected_input]);
+
+    let legacy_message = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::UserMessage(event) => Some(event.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(legacy_message.message, "please inspect sample.txt");
+    assert_eq!(legacy_message.text_elements, text_elements);
     Ok(())
 }
 
@@ -98,7 +107,9 @@ async fn assistant_message_item_is_emitted() -> anyhow::Result<()> {
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "please summarize results".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
 
@@ -154,7 +165,9 @@ async fn reasoning_item_is_emitted() -> anyhow::Result<()> {
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "explain your reasoning".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
 
@@ -196,8 +209,7 @@ async fn web_search_item_is_emitted() -> anyhow::Result<()> {
 
     let TestCodex { codex, .. } = test_codex().build(&server).await?;
 
-    let web_search_added =
-        ev_web_search_call_added("web-search-1", "in_progress", "weather seattle");
+    let web_search_added = ev_web_search_call_added_partial("web-search-1", "in_progress");
     let web_search_done = ev_web_search_call_done("web-search-1", "completed", "weather seattle");
 
     let first_response = sse(vec![
@@ -212,15 +224,14 @@ async fn web_search_item_is_emitted() -> anyhow::Result<()> {
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "find the weather".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
 
-    let started = wait_for_event_match(&codex, |ev| match ev {
-        EventMsg::ItemStarted(ItemStartedEvent {
-            item: TurnItem::WebSearch(item),
-            ..
-        }) => Some(item.clone()),
+    let begin = wait_for_event_match(&codex, |ev| match ev {
+        EventMsg::WebSearchBegin(event) => Some(event.clone()),
         _ => None,
     })
     .await;
@@ -233,8 +244,14 @@ async fn web_search_item_is_emitted() -> anyhow::Result<()> {
     })
     .await;
 
-    assert_eq!(started.id, completed.id);
-    assert_eq!(completed.query, "weather seattle");
+    assert_eq!(begin.call_id, "web-search-1");
+    assert_eq!(completed.id, begin.call_id);
+    assert_eq!(
+        completed.action,
+        WebSearchAction::Search {
+            query: Some("weather seattle".to_string()),
+        }
+    );
 
     Ok(())
 }
@@ -264,7 +281,9 @@ async fn agent_message_content_delta_has_item_metadata() -> anyhow::Result<()> {
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "please stream text".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
 
@@ -329,7 +348,9 @@ async fn reasoning_content_delta_has_item_metadata() -> anyhow::Result<()> {
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "reason through it".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
 
@@ -386,7 +407,9 @@ async fn reasoning_raw_content_delta_respects_flag() -> anyhow::Result<()> {
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
                 text: "show raw reasoning".into(),
+                text_elements: Vec::new(),
             }],
+            final_output_json_schema: None,
         })
         .await?;
 

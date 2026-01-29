@@ -1,3 +1,15 @@
+//! Transcript/history cells for the Codex TUI.
+//!
+//! A `HistoryCell` is the unit of display in the conversation UI, representing both committed
+//! transcript entries and, transiently, an in-flight active cell that can mutate in place while
+//! streaming.
+//!
+//! The transcript overlay (`Ctrl+T`) appends a cached live tail derived from the active cell, and
+//! that cached tail is refreshed based on an active-cell cache key. Cells that change based on
+//! elapsed time expose `transcript_animation_tick()`, and code that mutates the active cell in place
+//! bumps the active-cell revision tracked by `ChatWidget`, so the cache key changes whenever the
+//! rendered transcript output can change.
+
 use crate::diff_render::create_diff_summary;
 use crate::diff_render::display_path_for;
 use crate::exec_cell::CommandOutput;
@@ -7,6 +19,7 @@ use crate::exec_cell::output_lines;
 use crate::exec_cell::spinner;
 use crate::exec_command::relativize_to_home;
 use crate::exec_command::strip_bash_lc_and_escape;
+use crate::live_wrap::take_prefix_by_width;
 use crate::markdown::append_markdown;
 use crate::render::line_utils::line_to_static;
 use crate::render::line_utils::prefix_lines;
@@ -15,6 +28,7 @@ use crate::render::renderable::Renderable;
 use crate::style::user_message_style;
 use crate::text_formatting::format_and_truncate_tool_result;
 use crate::text_formatting::truncate_text;
+use crate::tooltips;
 use crate::ui_consts::LIVE_PREFIX_COLS;
 use crate::update_action::UpdateAction;
 use crate::version::CODEX_CLI_VERSION;
@@ -25,15 +39,17 @@ use base64::Engine;
 use codex_common::format_env_display::format_env_display;
 use codex_core::config::Config;
 use codex_core::config::types::McpServerTransportConfig;
-use codex_core::config::types::ReasoningSummaryFormat;
 use codex_core::protocol::FileChange;
 use codex_core::protocol::McpAuthStatus;
 use codex_core::protocol::McpInvocation;
 use codex_core::protocol::SessionConfiguredEvent;
-use codex_core::protocol_config_types::ReasoningEffort as ReasoningEffortConfig;
+use codex_core::web_search::web_search_detail;
+use codex_protocol::models::WebSearchAction;
+use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
+use codex_protocol::user_input::TextElement;
 use image::DynamicImage;
 use image::ImageReader;
 use mcp_types::EmbeddedResourceResource;
@@ -41,6 +57,7 @@ use mcp_types::Resource;
 use mcp_types::ResourceLink;
 use mcp_types::ResourceTemplate;
 use ratatui::prelude::*;
+use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Style;
 use ratatui::style::Styled;
@@ -55,6 +72,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::error;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// Represents an event to display in the conversation history. Returns its
@@ -97,6 +115,20 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
     fn is_stream_continuation(&self) -> bool {
         false
     }
+
+    /// Returns a coarse "animation tick" when transcript output is time-dependent.
+    ///
+    /// The transcript overlay caches the rendered output of the in-flight active cell, so cells
+    /// that include time-based UI (spinner, shimmer, etc.) should return a tick that changes over
+    /// time to signal that the cached tail should be recomputed. Returning `None` means the
+    /// transcript lines are stable, while returning `Some(tick)` during an in-flight animation
+    /// allows the overlay to keep up with the main viewport.
+    ///
+    /// If a cell uses time-based visuals but always returns `None`, `Ctrl+T` can appear "frozen" on
+    /// the first rendered frame even though the main viewport is animating.
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        None
+    }
 }
 
 impl Renderable for Box<dyn HistoryCell> {
@@ -130,6 +162,75 @@ impl dyn HistoryCell {
 #[derive(Debug)]
 pub(crate) struct UserHistoryCell {
     pub message: String,
+    pub text_elements: Vec<TextElement>,
+    #[allow(dead_code)]
+    pub local_image_paths: Vec<PathBuf>,
+}
+
+/// Build logical lines for a user message with styled text elements.
+///
+/// This preserves explicit newlines while interleaving element spans and skips
+/// malformed byte ranges instead of panicking during history rendering.
+fn build_user_message_lines_with_elements(
+    message: &str,
+    elements: &[TextElement],
+    style: Style,
+    element_style: Style,
+) -> Vec<Line<'static>> {
+    let mut elements = elements.to_vec();
+    elements.sort_by_key(|e| e.byte_range.start);
+    let mut offset = 0usize;
+    let mut raw_lines: Vec<Line<'static>> = Vec::new();
+    for line_text in message.split('\n') {
+        let line_start = offset;
+        let line_end = line_start + line_text.len();
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        // Track how much of the line we've emitted to interleave plain and styled spans.
+        let mut cursor = line_start;
+        for elem in &elements {
+            let start = elem.byte_range.start.max(line_start);
+            let end = elem.byte_range.end.min(line_end);
+            if start >= end {
+                continue;
+            }
+            let rel_start = start - line_start;
+            let rel_end = end - line_start;
+            // Guard against malformed UTF-8 byte ranges from upstream data; skip
+            // invalid elements rather than panicking while rendering history.
+            if !line_text.is_char_boundary(rel_start) || !line_text.is_char_boundary(rel_end) {
+                continue;
+            }
+            let rel_cursor = cursor - line_start;
+            if cursor < start
+                && line_text.is_char_boundary(rel_cursor)
+                && let Some(segment) = line_text.get(rel_cursor..rel_start)
+            {
+                spans.push(Span::from(segment.to_string()));
+            }
+            if let Some(segment) = line_text.get(rel_start..rel_end) {
+                spans.push(Span::styled(segment.to_string(), element_style));
+                cursor = end;
+            }
+        }
+        let rel_cursor = cursor - line_start;
+        if cursor < line_end
+            && line_text.is_char_boundary(rel_cursor)
+            && let Some(segment) = line_text.get(rel_cursor..)
+        {
+            spans.push(Span::from(segment.to_string()));
+        }
+        let line = if spans.is_empty() {
+            Line::from(line_text.to_string()).style(style)
+        } else {
+            Line::from(spans).style(style)
+        };
+        raw_lines.push(line);
+        // Split on '\n' so any '\r' stays in the line; advancing by 1 accounts
+        // for the separator byte.
+        offset = line_end + 1;
+    }
+
+    raw_lines
 }
 
 impl HistoryCell for UserHistoryCell {
@@ -143,13 +244,28 @@ impl HistoryCell for UserHistoryCell {
             .max(1);
 
         let style = user_message_style();
+        let element_style = style.fg(Color::Cyan);
 
-        let wrapped = word_wrap_lines(
-            self.message.lines().map(|l| Line::from(l).style(style)),
-            // Wrap algorithm matches textarea.rs.
-            RtOptions::new(usize::from(wrap_width))
-                .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
-        );
+        let wrapped = if self.text_elements.is_empty() {
+            word_wrap_lines(
+                self.message.split('\n').map(|l| Line::from(l).style(style)),
+                // Wrap algorithm matches textarea.rs.
+                RtOptions::new(usize::from(wrap_width))
+                    .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
+            )
+        } else {
+            let raw_lines = build_user_message_lines_with_elements(
+                &self.message,
+                &self.text_elements,
+                style,
+                element_style,
+            );
+            word_wrap_lines(
+                raw_lines,
+                RtOptions::new(usize::from(wrap_width))
+                    .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
+            )
+        };
 
         lines.push(Line::from("").style(style));
         lines.extend(prefix_lines(wrapped, "› ".bold().dim(), "  ".into()));
@@ -374,6 +490,172 @@ impl HistoryCell for PrefixedWrappedHistoryCell {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct UnifiedExecInteractionCell {
+    command_display: Option<String>,
+    stdin: String,
+}
+
+impl UnifiedExecInteractionCell {
+    pub(crate) fn new(command_display: Option<String>, stdin: String) -> Self {
+        Self {
+            command_display,
+            stdin,
+        }
+    }
+}
+
+impl HistoryCell for UnifiedExecInteractionCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        if width == 0 {
+            return Vec::new();
+        }
+        let wrap_width = width as usize;
+
+        let mut header_spans = vec!["↳ ".dim(), "Interacted with background terminal".bold()];
+        if let Some(command) = &self.command_display
+            && !command.is_empty()
+        {
+            header_spans.push(" · ".dim());
+            header_spans.push(command.clone().dim());
+        }
+        let header = Line::from(header_spans);
+
+        let mut out: Vec<Line<'static>> = Vec::new();
+        let header_wrapped = word_wrap_line(&header, RtOptions::new(wrap_width));
+        push_owned_lines(&header_wrapped, &mut out);
+
+        let input_lines: Vec<Line<'static>> = if self.stdin.is_empty() {
+            vec![vec!["(waited)".dim()].into()]
+        } else {
+            self.stdin
+                .lines()
+                .map(|line| Line::from(line.to_string()))
+                .collect()
+        };
+
+        let input_wrapped = word_wrap_lines(
+            input_lines,
+            RtOptions::new(wrap_width)
+                .initial_indent(Line::from("  └ ".dim()))
+                .subsequent_indent(Line::from("    ".dim())),
+        );
+        out.extend(input_wrapped);
+        out
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        self.display_lines(width).len() as u16
+    }
+}
+
+pub(crate) fn new_unified_exec_interaction(
+    command_display: Option<String>,
+    stdin: String,
+) -> UnifiedExecInteractionCell {
+    UnifiedExecInteractionCell::new(command_display, stdin)
+}
+
+#[derive(Debug)]
+struct UnifiedExecProcessesCell {
+    processes: Vec<String>,
+}
+
+impl UnifiedExecProcessesCell {
+    fn new(processes: Vec<String>) -> Self {
+        Self { processes }
+    }
+}
+
+impl HistoryCell for UnifiedExecProcessesCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        if width == 0 {
+            return Vec::new();
+        }
+
+        let wrap_width = width as usize;
+        let max_processes = 16usize;
+        let mut out: Vec<Line<'static>> = Vec::new();
+        out.push(vec!["Background terminals".bold()].into());
+        out.push("".into());
+
+        if self.processes.is_empty() {
+            out.push("  • No background terminals running.".italic().into());
+            return out;
+        }
+
+        let prefix = "  • ";
+        let prefix_width = UnicodeWidthStr::width(prefix);
+        let truncation_suffix = " [...]";
+        let truncation_suffix_width = UnicodeWidthStr::width(truncation_suffix);
+        let mut shown = 0usize;
+        for command in &self.processes {
+            if shown >= max_processes {
+                break;
+            }
+            let (snippet, snippet_truncated) = {
+                let (first_line, has_more_lines) = match command.split_once('\n') {
+                    Some((first, _)) => (first, true),
+                    None => (command.as_str(), false),
+                };
+                let max_graphemes = 80;
+                let mut graphemes = first_line.grapheme_indices(true);
+                if let Some((byte_index, _)) = graphemes.nth(max_graphemes) {
+                    (first_line[..byte_index].to_string(), true)
+                } else {
+                    (first_line.to_string(), has_more_lines)
+                }
+            };
+            if wrap_width <= prefix_width {
+                out.push(Line::from(prefix.dim()));
+                shown += 1;
+                continue;
+            }
+            let budget = wrap_width.saturating_sub(prefix_width);
+            let mut needs_suffix = snippet_truncated;
+            if !needs_suffix {
+                let (_, remainder, _) = take_prefix_by_width(&snippet, budget);
+                if !remainder.is_empty() {
+                    needs_suffix = true;
+                }
+            }
+            if needs_suffix && budget > truncation_suffix_width {
+                let available = budget.saturating_sub(truncation_suffix_width);
+                let (truncated, _, _) = take_prefix_by_width(&snippet, available);
+                out.push(vec![prefix.dim(), truncated.cyan(), truncation_suffix.dim()].into());
+            } else {
+                let (truncated, _, _) = take_prefix_by_width(&snippet, budget);
+                out.push(vec![prefix.dim(), truncated.cyan()].into());
+            }
+            shown += 1;
+        }
+
+        let remaining = self.processes.len().saturating_sub(shown);
+        if remaining > 0 {
+            let more_text = format!("... and {remaining} more running");
+            if wrap_width <= prefix_width {
+                out.push(Line::from(prefix.dim()));
+            } else {
+                let budget = wrap_width.saturating_sub(prefix_width);
+                let (truncated, _, _) = take_prefix_by_width(&more_text, budget);
+                out.push(vec![prefix.dim(), truncated.dim()].into());
+            }
+        }
+
+        out
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        self.display_lines(width).len() as u16
+    }
+}
+
+pub(crate) fn new_unified_exec_processes_output(processes: Vec<String>) -> CompositeHistoryCell {
+    let command = PlainHistoryCell::new(vec!["/ps".magenta().into()]);
+    let summary = UnifiedExecProcessesCell::new(processes);
+    CompositeHistoryCell::new(vec![Box::new(command), Box::new(summary)])
+}
+
 fn truncate_exec_snippet(full_cmd: &str) -> String {
     let mut snippet = match full_cmd.split_once('\n') {
         Some((first, _)) => format!("{first} ..."),
@@ -405,6 +687,19 @@ pub fn new_approval_decision_cell(
                     " codex to run ".into(),
                     snippet,
                     " this time".bold(),
+                ],
+            )
+        }
+        ApprovedExecpolicyAmendment { .. } => {
+            let snippet = Span::from(exec_snippet(&command)).dim();
+            (
+                "✔ ".green(),
+                vec![
+                    "You ".into(),
+                    "approved".bold(),
+                    " codex to run ".into(),
+                    snippet,
+                    " and applied the execpolicy amendment".bold(),
                 ],
             )
         }
@@ -560,6 +855,35 @@ pub(crate) fn padded_emoji(emoji: &str) -> String {
 }
 
 #[derive(Debug)]
+struct TooltipHistoryCell {
+    tip: String,
+}
+
+impl TooltipHistoryCell {
+    fn new(tip: String) -> Self {
+        Self { tip }
+    }
+}
+
+impl HistoryCell for TooltipHistoryCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let indent = "  ";
+        let indent_width = UnicodeWidthStr::width(indent);
+        let wrap_width = usize::from(width.max(1))
+            .saturating_sub(indent_width)
+            .max(1);
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        append_markdown(
+            &format!("**Tip:** {}", self.tip),
+            Some(wrap_width),
+            &mut lines,
+        );
+
+        prefix_lines(lines, indent.into(), indent.into())
+    }
+}
+
+#[derive(Debug)]
 pub struct SessionInfoCell(CompositeHistoryCell);
 
 impl HistoryCell for SessionInfoCell {
@@ -578,6 +902,7 @@ impl HistoryCell for SessionInfoCell {
 
 pub(crate) fn new_session_info(
     config: &Config,
+    requested_model: &str,
     event: SessionConfiguredEvent,
     is_first_event: bool,
 ) -> SessionInfoCell {
@@ -586,15 +911,16 @@ pub(crate) fn new_session_info(
         reasoning_effort,
         ..
     } = event;
-    SessionInfoCell(if is_first_event {
-        // Header box rendered as history (so it appears at the very top)
-        let header = SessionHeaderHistoryCell::new(
-            model,
-            reasoning_effort,
-            config.cwd.clone(),
-            crate::version::CODEX_CLI_VERSION,
-        );
+    // Header box rendered as history (so it appears at the very top)
+    let header = SessionHeaderHistoryCell::new(
+        model.clone(),
+        reasoning_effort,
+        config.cwd.clone(),
+        CODEX_CLI_VERSION,
+    );
+    let mut parts: Vec<Box<dyn HistoryCell>> = vec![Box::new(header)];
 
+    if is_first_event {
         // Help lines below the header (new copy and list)
         let help_lines: Vec<Line<'static>> = vec![
             "  To get started, describe a task or try one of these commands:"
@@ -618,6 +944,11 @@ pub(crate) fn new_session_info(
             ]),
             Line::from(vec![
                 "  ".into(),
+                "/permissions".into(),
+                " - choose what Codex is allowed to do".dim(),
+            ]),
+            Line::from(vec![
+                "  ".into(),
                 "/model".into(),
                 " - choose what model and reasoning effort to use".dim(),
             ]),
@@ -628,41 +959,66 @@ pub(crate) fn new_session_info(
             ]),
         ];
 
-        CompositeHistoryCell {
-            parts: vec![
-                Box::new(header),
-                Box::new(PlainHistoryCell { lines: help_lines }),
-            ],
-        }
-    } else if config.model == model {
-        CompositeHistoryCell { parts: vec![] }
+        parts.push(Box::new(PlainHistoryCell { lines: help_lines }));
     } else {
-        let lines = vec![
-            "model changed:".magenta().bold().into(),
-            format!("requested: {}", config.model).into(),
-            format!("used: {model}").into(),
-        ];
-        CompositeHistoryCell {
-            parts: vec![Box::new(PlainHistoryCell { lines })],
+        if config.show_tooltips
+            && let Some(tooltips) = tooltips::random_tooltip().map(TooltipHistoryCell::new)
+        {
+            parts.push(Box::new(tooltips));
         }
-    })
+        if requested_model != model {
+            let lines = vec![
+                "model changed:".magenta().bold().into(),
+                format!("requested: {requested_model}").into(),
+                format!("used: {model}").into(),
+            ];
+            parts.push(Box::new(PlainHistoryCell { lines }));
+        }
+    }
+
+    SessionInfoCell(CompositeHistoryCell { parts })
 }
 
-pub(crate) fn new_user_prompt(message: String) -> UserHistoryCell {
-    UserHistoryCell { message }
+pub(crate) fn new_user_prompt(
+    message: String,
+    text_elements: Vec<TextElement>,
+    local_image_paths: Vec<PathBuf>,
+) -> UserHistoryCell {
+    UserHistoryCell {
+        message,
+        text_elements,
+        local_image_paths,
+    }
 }
 
 #[derive(Debug)]
-struct SessionHeaderHistoryCell {
+pub(crate) struct SessionHeaderHistoryCell {
     version: &'static str,
     model: String,
+    model_style: Style,
     reasoning_effort: Option<ReasoningEffortConfig>,
     directory: PathBuf,
 }
 
 impl SessionHeaderHistoryCell {
-    fn new(
+    pub(crate) fn new(
         model: String,
+        reasoning_effort: Option<ReasoningEffortConfig>,
+        directory: PathBuf,
+        version: &'static str,
+    ) -> Self {
+        Self::new_with_style(
+            model,
+            Style::default(),
+            reasoning_effort,
+            directory,
+            version,
+        )
+    }
+
+    pub(crate) fn new_with_style(
+        model: String,
+        model_style: Style,
         reasoning_effort: Option<ReasoningEffortConfig>,
         directory: PathBuf,
         version: &'static str,
@@ -670,6 +1026,7 @@ impl SessionHeaderHistoryCell {
         Self {
             version,
             model,
+            model_style,
             reasoning_effort,
             directory,
         }
@@ -734,23 +1091,27 @@ impl HistoryCell for SessionHeaderHistoryCell {
         const CHANGE_MODEL_HINT_EXPLANATION: &str = " to change";
         const DIR_LABEL: &str = "directory:";
         let label_width = DIR_LABEL.len();
+
         let model_label = format!(
             "{model_label:<label_width$}",
             model_label = "model:",
             label_width = label_width
         );
         let reasoning_label = self.reasoning_label();
-        let mut model_spans: Vec<Span<'static>> = vec![
-            Span::from(format!("{model_label} ")).dim(),
-            Span::from(self.model.clone()),
-        ];
-        if let Some(reasoning) = reasoning_label {
-            model_spans.push(Span::from(" "));
-            model_spans.push(Span::from(reasoning));
-        }
-        model_spans.push("   ".dim());
-        model_spans.push(CHANGE_MODEL_HINT_COMMAND.cyan());
-        model_spans.push(CHANGE_MODEL_HINT_EXPLANATION.dim());
+        let model_spans: Vec<Span<'static>> = {
+            let mut spans = vec![
+                Span::from(format!("{model_label} ")).dim(),
+                Span::styled(self.model.clone(), self.model_style),
+            ];
+            if let Some(reasoning) = reasoning_label {
+                spans.push(Span::from(" "));
+                spans.push(Span::from(reasoning));
+            }
+            spans.push("   ".dim());
+            spans.push(CHANGE_MODEL_HINT_COMMAND.cyan());
+            spans.push(CHANGE_MODEL_HINT_EXPLANATION.dim());
+            spans
+        };
 
         let dir_label = format!("{DIR_LABEL:<label_width$}");
         let dir_prefix = format!("{dir_label} ");
@@ -966,6 +1327,13 @@ impl HistoryCell for McpToolCallCell {
 
         lines
     }
+
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        if !self.animations_enabled || self.result.is_some() {
+            return None;
+        }
+        Some((self.start_time.elapsed().as_millis() / 50) as u64)
+    }
 }
 
 pub(crate) fn new_active_mcp_tool_call(
@@ -976,49 +1344,147 @@ pub(crate) fn new_active_mcp_tool_call(
     McpToolCallCell::new(call_id, invocation, animations_enabled)
 }
 
-pub(crate) fn new_web_search_call(query: String) -> PlainHistoryCell {
-    let lines: Vec<Line<'static>> = vec![Line::from(vec![padded_emoji("🌐").into(), query.into()])];
-    PlainHistoryCell { lines }
+fn web_search_header(completed: bool) -> &'static str {
+    if completed {
+        "Searched"
+    } else {
+        "Searching the web"
+    }
 }
 
-/// If the first content is an image, return a new cell with the image.
-/// TODO(rgwood-dd): Handle images properly even if they're not the first result.
+#[derive(Debug)]
+pub(crate) struct WebSearchCell {
+    call_id: String,
+    query: String,
+    action: Option<WebSearchAction>,
+    start_time: Instant,
+    completed: bool,
+    animations_enabled: bool,
+}
+
+impl WebSearchCell {
+    pub(crate) fn new(
+        call_id: String,
+        query: String,
+        action: Option<WebSearchAction>,
+        animations_enabled: bool,
+    ) -> Self {
+        Self {
+            call_id,
+            query,
+            action,
+            start_time: Instant::now(),
+            completed: false,
+            animations_enabled,
+        }
+    }
+
+    pub(crate) fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    pub(crate) fn update(&mut self, action: WebSearchAction, query: String) {
+        self.action = Some(action);
+        self.query = query;
+    }
+
+    pub(crate) fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl HistoryCell for WebSearchCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let bullet = if self.completed {
+            "•".dim()
+        } else {
+            spinner(Some(self.start_time), self.animations_enabled)
+        };
+        let header = web_search_header(self.completed);
+        let detail = web_search_detail(self.action.as_ref(), &self.query);
+        let text: Text<'static> = if detail.is_empty() {
+            Line::from(vec![header.bold()]).into()
+        } else {
+            Line::from(vec![header.bold(), " ".into(), detail.into()]).into()
+        };
+        PrefixedWrappedHistoryCell::new(text, vec![bullet, " ".into()], "  ").display_lines(width)
+    }
+}
+
+pub(crate) fn new_active_web_search_call(
+    call_id: String,
+    query: String,
+    animations_enabled: bool,
+) -> WebSearchCell {
+    WebSearchCell::new(call_id, query, None, animations_enabled)
+}
+
+pub(crate) fn new_web_search_call(
+    call_id: String,
+    query: String,
+    action: WebSearchAction,
+) -> WebSearchCell {
+    let mut cell = WebSearchCell::new(call_id, query, Some(action), false);
+    cell.complete();
+    cell
+}
+
+/// Returns an additional history cell if an MCP tool result includes a decodable image.
+///
+/// This intentionally returns at most one cell: the first image in `CallToolResult.content` that
+/// successfully base64-decodes and parses as an image. This is used as a lightweight “image output
+/// exists” affordance separate from the main MCP tool call cell.
+///
+/// Manual testing tip:
+/// - Run the rmcp stdio test server (`codex-rs/rmcp-client/src/bin/test_stdio_server.rs`) and
+///   register it as an MCP server via `codex mcp add`.
+/// - Use its `image_scenario` tool with cases like `text_then_image`,
+///   `invalid_base64_then_image`, or `invalid_image_bytes_then_image` to ensure this path triggers
+///   even when the first block is not a valid image.
 fn try_new_completed_mcp_tool_call_with_image_output(
     result: &Result<mcp_types::CallToolResult, String>,
 ) -> Option<CompletedMcpToolCallWithImageOutput> {
-    match result {
-        Ok(mcp_types::CallToolResult { content, .. }) => {
-            if let Some(mcp_types::ContentBlock::ImageContent(image)) = content.first() {
-                let raw_data = match base64::engine::general_purpose::STANDARD.decode(&image.data) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        error!("Failed to decode image data: {e}");
-                        return None;
-                    }
-                };
-                let reader = match ImageReader::new(Cursor::new(raw_data)).with_guessed_format() {
-                    Ok(reader) => reader,
-                    Err(e) => {
-                        error!("Failed to guess image format: {e}");
-                        return None;
-                    }
-                };
+    let image = result
+        .as_ref()
+        .ok()?
+        .content
+        .iter()
+        .find_map(decode_mcp_image)?;
 
-                let image = match reader.decode() {
-                    Ok(image) => image,
-                    Err(e) => {
-                        error!("Image decoding failed: {e}");
-                        return None;
-                    }
-                };
+    Some(CompletedMcpToolCallWithImageOutput { _image: image })
+}
 
-                Some(CompletedMcpToolCallWithImageOutput { _image: image })
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
+/// Decodes an MCP `ImageContent` block into an in-memory image.
+///
+/// Returns `None` when the block is not an image, when base64 decoding fails, when the format
+/// cannot be inferred, or when the image decoder rejects the bytes.
+fn decode_mcp_image(block: &mcp_types::ContentBlock) -> Option<DynamicImage> {
+    let image = match block {
+        mcp_types::ContentBlock::ImageContent(image) => image,
+        _ => return None,
+    };
+    let raw_data = base64::engine::general_purpose::STANDARD
+        .decode(&image.data)
+        .map_err(|e| {
+            error!("Failed to decode image data: {e}");
+            e
+        })
+        .ok()?;
+    let reader = ImageReader::new(Cursor::new(raw_data))
+        .with_guessed_format()
+        .map_err(|e| {
+            error!("Failed to guess image format: {e}");
+            e
+        })
+        .ok()?;
+
+    reader
+        .decode()
+        .map_err(|e| {
+            error!("Image decoding failed: {e}");
+            e
+        })
+        .ok()
 }
 
 #[allow(clippy::disallowed_methods)]
@@ -1068,7 +1534,8 @@ pub(crate) fn empty_mcp_output() -> PlainHistoryCell {
         "  • No MCP servers configured.".italic().into(),
         Line::from(vec![
             "    See the ".into(),
-            "\u{1b}]8;;https://github.com/openai/codex/blob/main/docs/config.md#mcp_servers\u{7}MCP docs\u{1b}]8;;\u{7}".underlined(),
+            "\u{1b}]8;;https://developers.openai.com/codex/mcp\u{7}MCP docs\u{1b}]8;;\u{7}"
+                .underlined(),
             " to configure them.".into(),
         ])
         .style(Style::default().add_modifier(Modifier::DIM)),
@@ -1095,7 +1562,6 @@ pub(crate) fn new_mcp_tools_output(
     if tools.is_empty() {
         lines.push("  • No MCP tools available.".italic().into());
         lines.push("".into());
-        return PlainHistoryCell { lines };
     }
 
     let mut servers: Vec<_> = config.mcp_servers.iter().collect();
@@ -1119,6 +1585,9 @@ pub(crate) fn new_mcp_tools_output(
             header.push(" ".into());
             header.push("(disabled)".red());
             lines.push(header.into());
+            if let Some(reason) = cfg.disabled_reason.as_ref().map(ToString::to_string) {
+                lines.push(vec!["    • Reason: ".into(), reason.dim()].into());
+            }
             lines.push(Line::from(""));
             continue;
         }
@@ -1374,48 +1843,43 @@ pub(crate) fn new_view_image_tool_call(path: PathBuf, cwd: &Path) -> PlainHistor
     PlainHistoryCell { lines }
 }
 
-pub(crate) fn new_reasoning_summary_block(
-    full_reasoning_buffer: String,
-    config: &Config,
-) -> Box<dyn HistoryCell> {
-    if config.model_family.reasoning_summary_format == ReasoningSummaryFormat::Experimental {
-        // Experimental format is following:
-        // ** header **
-        //
-        // reasoning summary
-        //
-        // So we need to strip header from reasoning summary
-        let full_reasoning_buffer = full_reasoning_buffer.trim();
-        if let Some(open) = full_reasoning_buffer.find("**") {
-            let after_open = &full_reasoning_buffer[(open + 2)..];
-            if let Some(close) = after_open.find("**") {
-                let after_close_idx = open + 2 + close + 2;
-                // if we don't have anything beyond `after_close_idx`
-                // then we don't have a summary to inject into history
-                if after_close_idx < full_reasoning_buffer.len() {
-                    let header_buffer = full_reasoning_buffer[..after_close_idx].to_string();
-                    let summary_buffer = full_reasoning_buffer[after_close_idx..].to_string();
-                    return Box::new(ReasoningSummaryCell::new(
-                        header_buffer,
-                        summary_buffer,
-                        false,
-                    ));
-                }
+pub(crate) fn new_reasoning_summary_block(full_reasoning_buffer: String) -> Box<dyn HistoryCell> {
+    let full_reasoning_buffer = full_reasoning_buffer.trim();
+    if let Some(open) = full_reasoning_buffer.find("**") {
+        let after_open = &full_reasoning_buffer[(open + 2)..];
+        if let Some(close) = after_open.find("**") {
+            let after_close_idx = open + 2 + close + 2;
+            // if we don't have anything beyond `after_close_idx`
+            // then we don't have a summary to inject into history
+            if after_close_idx < full_reasoning_buffer.len() {
+                let header_buffer = full_reasoning_buffer[..after_close_idx].to_string();
+                let summary_buffer = full_reasoning_buffer[after_close_idx..].to_string();
+                return Box::new(ReasoningSummaryCell::new(
+                    header_buffer,
+                    summary_buffer,
+                    false,
+                ));
             }
         }
     }
     Box::new(ReasoningSummaryCell::new(
         "".to_string(),
-        full_reasoning_buffer,
+        full_reasoning_buffer.to_string(),
         true,
     ))
 }
 
 #[derive(Debug)]
+/// A visual divider between turns, optionally showing how long the assistant "worked for".
+///
+/// This separator is only emitted for turns that performed concrete work (e.g., running commands,
+/// applying patches, making MCP tool calls), so purely conversational turns do not show an empty
+/// divider.
 pub struct FinalMessageSeparator {
     elapsed_seconds: Option<u64>,
 }
 impl FinalMessageSeparator {
+    /// Creates a separator; `elapsed_seconds` typically comes from the status indicator timer.
     pub(crate) fn new(elapsed_seconds: Option<u64>) -> Self {
         Self { elapsed_seconds }
     }
@@ -1469,11 +1933,11 @@ mod tests {
     use crate::exec_cell::ExecCall;
     use crate::exec_cell::ExecCell;
     use codex_core::config::Config;
-    use codex_core::config::ConfigOverrides;
-    use codex_core::config::ConfigToml;
+    use codex_core::config::ConfigBuilder;
     use codex_core::config::types::McpServerConfig;
     use codex_core::config::types::McpServerTransportConfig;
     use codex_core::protocol::McpAuthStatus;
+    use codex_protocol::models::WebSearchAction;
     use codex_protocol::parse_command::ParsedCommand;
     use dirs::home_dir;
     use pretty_assertions::assert_eq;
@@ -1483,17 +1947,19 @@ mod tests {
     use codex_core::protocol::ExecCommandSource;
     use mcp_types::CallToolResult;
     use mcp_types::ContentBlock;
+    use mcp_types::ImageContent;
     use mcp_types::TextContent;
     use mcp_types::Tool;
     use mcp_types::ToolInputSchema;
 
-    fn test_config() -> Config {
-        Config::load_from_base_config_with_overrides(
-            ConfigToml::default(),
-            ConfigOverrides::default(),
-            std::env::temp_dir(),
-        )
-        .expect("config")
+    const SMALL_PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+    async fn test_config() -> Config {
+        let codex_home = std::env::temp_dir();
+        ConfigBuilder::default()
+            .codex_home(codex_home.clone())
+            .build()
+            .await
+            .expect("config")
     }
 
     fn render_lines(lines: &[Line<'static>]) -> Vec<String> {
@@ -1512,9 +1978,78 @@ mod tests {
         render_lines(&cell.transcript_lines(u16::MAX))
     }
 
+    fn image_block(data: &str) -> ContentBlock {
+        ContentBlock::ImageContent(ImageContent {
+            annotations: None,
+            data: data.to_string(),
+            mime_type: "image/png".into(),
+            r#type: "image".into(),
+        })
+    }
+
     #[test]
-    fn mcp_tools_output_masks_sensitive_values() {
-        let mut config = test_config();
+    fn unified_exec_interaction_cell_renders_input() {
+        let cell =
+            new_unified_exec_interaction(Some("echo hello".to_string()), "ls\npwd".to_string());
+        let lines = render_transcript(&cell);
+        assert_eq!(
+            lines,
+            vec![
+                "↳ Interacted with background terminal · echo hello",
+                "  └ ls",
+                "    pwd",
+            ],
+        );
+    }
+
+    #[test]
+    fn unified_exec_interaction_cell_renders_wait() {
+        let cell = new_unified_exec_interaction(None, String::new());
+        let lines = render_transcript(&cell);
+        assert_eq!(
+            lines,
+            vec!["↳ Interacted with background terminal", "  └ (waited)"],
+        );
+    }
+
+    #[test]
+    fn ps_output_empty_snapshot() {
+        let cell = new_unified_exec_processes_output(Vec::new());
+        let rendered = render_lines(&cell.display_lines(60)).join("\n");
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn ps_output_multiline_snapshot() {
+        let cell = new_unified_exec_processes_output(vec![
+            "echo hello\nand then some extra text".to_string(),
+            "rg \"foo\" src".to_string(),
+        ]);
+        let rendered = render_lines(&cell.display_lines(40)).join("\n");
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn ps_output_long_command_snapshot() {
+        let cell = new_unified_exec_processes_output(vec![String::from(
+            "rg \"foo\" src --glob '**/*.rs' --max-count 1000 --no-ignore --hidden --follow --glob '!target/**'",
+        )]);
+        let rendered = render_lines(&cell.display_lines(36)).join("\n");
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn ps_output_many_sessions_snapshot() {
+        let cell = new_unified_exec_processes_output(
+            (0..20).map(|idx| format!("command {idx}")).collect(),
+        );
+        let rendered = render_lines(&cell.display_lines(32)).join("\n");
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_output_masks_sensitive_values() {
+        let mut config = test_config().await;
         let mut env = HashMap::new();
         env.insert("TOKEN".to_string(), "secret".to_string());
         let stdio_config = McpServerConfig {
@@ -1526,12 +2061,15 @@ mod tests {
                 cwd: None,
             },
             enabled: true,
+            disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
             enabled_tools: None,
             disabled_tools: None,
+            scopes: None,
         };
-        config.mcp_servers.insert("docs".to_string(), stdio_config);
+        let mut servers = config.mcp_servers.get().clone();
+        servers.insert("docs".to_string(), stdio_config);
 
         let mut headers = HashMap::new();
         headers.insert("Authorization".to_string(), "Bearer secret".to_string());
@@ -1545,12 +2083,18 @@ mod tests {
                 env_http_headers: Some(env_headers),
             },
             enabled: true,
+            disabled_reason: None,
             startup_timeout_sec: None,
             tool_timeout_sec: None,
             enabled_tools: None,
             disabled_tools: None,
+            scopes: None,
         };
-        config.mcp_servers.insert("http".to_string(), http_config);
+        servers.insert("http".to_string(), http_config);
+        config
+            .mcp_servers
+            .set(servers)
+            .expect("test mcp servers should accept any configuration");
 
         let mut tools: HashMap<String, Tool> = HashMap::new();
         tools.insert(
@@ -1618,13 +2162,74 @@ mod tests {
         assert_eq!(
             rendered,
             vec![
-                "✔ You approved codex".to_string(),
-                "  to run echo something".to_string(),
+                "✔ You approved codex to".to_string(),
+                "  run echo something".to_string(),
                 "  really long to ensure".to_string(),
                 "  wrapping happens this".to_string(),
                 "  time".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn web_search_history_cell_snapshot() {
+        let query =
+            "example search query with several generic words to exercise wrapping".to_string();
+        let cell = new_web_search_call(
+            "call-1".to_string(),
+            query.clone(),
+            WebSearchAction::Search { query: Some(query) },
+        );
+        let rendered = render_lines(&cell.display_lines(64)).join("\n");
+
+        insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn web_search_history_cell_wraps_with_indented_continuation() {
+        let query =
+            "example search query with several generic words to exercise wrapping".to_string();
+        let cell = new_web_search_call(
+            "call-1".to_string(),
+            query.clone(),
+            WebSearchAction::Search { query: Some(query) },
+        );
+        let rendered = render_lines(&cell.display_lines(64));
+
+        assert_eq!(
+            rendered,
+            vec![
+                "• Searched example search query with several generic words to".to_string(),
+                "  exercise wrapping".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn web_search_history_cell_short_query_does_not_wrap() {
+        let query = "short query".to_string();
+        let cell = new_web_search_call(
+            "call-1".to_string(),
+            query.clone(),
+            WebSearchAction::Search { query: Some(query) },
+        );
+        let rendered = render_lines(&cell.display_lines(64));
+
+        assert_eq!(rendered, vec!["• Searched short query".to_string()]);
+    }
+
+    #[test]
+    fn web_search_history_cell_transcript_snapshot() {
+        let query =
+            "example search query with several generic words to exercise wrapping".to_string();
+        let cell = new_web_search_call(
+            "call-1".to_string(),
+            query.clone(),
+            WebSearchAction::Search { query: Some(query) },
+        );
+        let rendered = render_lines(&cell.transcript_lines(64)).join("\n");
+
+        insta::assert_snapshot!(rendered);
     }
 
     #[test]
@@ -1674,6 +2279,63 @@ mod tests {
         let rendered = render_lines(&cell.display_lines(80)).join("\n");
 
         insta::assert_snapshot!(rendered);
+    }
+
+    #[test]
+    fn completed_mcp_tool_call_image_after_text_returns_extra_cell() {
+        let invocation = McpInvocation {
+            server: "image".into(),
+            tool: "generate".into(),
+            arguments: Some(json!({
+                "prompt": "tiny image",
+            })),
+        };
+
+        let result = CallToolResult {
+            content: vec![
+                ContentBlock::TextContent(TextContent {
+                    annotations: None,
+                    text: "Here is the image:".into(),
+                    r#type: "text".into(),
+                }),
+                image_block(SMALL_PNG_BASE64),
+            ],
+            is_error: None,
+            structured_content: None,
+        };
+
+        let mut cell = new_active_mcp_tool_call("call-image".into(), invocation, true);
+        let extra_cell = cell
+            .complete(Duration::from_millis(25), Ok(result))
+            .expect("expected image cell");
+
+        let rendered = render_lines(&extra_cell.display_lines(80));
+        assert_eq!(rendered, vec!["tool result (image output)"]);
+    }
+
+    #[test]
+    fn completed_mcp_tool_call_skips_invalid_image_blocks() {
+        let invocation = McpInvocation {
+            server: "image".into(),
+            tool: "generate".into(),
+            arguments: Some(json!({
+                "prompt": "tiny image",
+            })),
+        };
+
+        let result = CallToolResult {
+            content: vec![image_block("not-base64"), image_block(SMALL_PNG_BASE64)],
+            is_error: None,
+            structured_content: None,
+        };
+
+        let mut cell = new_active_mcp_tool_call("call-image-2".into(), invocation, true);
+        let extra_cell = cell
+            .complete(Duration::from_millis(25), Ok(result))
+            .expect("expected image cell");
+
+        let rendered = render_lines(&extra_cell.display_lines(80));
+        assert_eq!(rendered, vec!["tool result (image output)"]);
     }
 
     #[test]
@@ -2212,6 +2874,8 @@ mod tests {
         let msg = "one two three four five six seven";
         let cell = UserHistoryCell {
             message: msg.to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
         };
 
         // Small width to force wrapping more clearly. Effective wrap width is width-2 due to the ▌ prefix and trailing space.
@@ -2276,12 +2940,8 @@ mod tests {
     }
     #[test]
     fn reasoning_summary_block() {
-        let mut config = test_config();
-        config.model_family.reasoning_summary_format = ReasoningSummaryFormat::Experimental;
-
         let cell = new_reasoning_summary_block(
             "**High level reasoning**\n\nDetailed reasoning goes here.".to_string(),
-            &config,
         );
 
         let rendered_display = render_lines(&cell.display_lines(80));
@@ -2293,25 +2953,29 @@ mod tests {
 
     #[test]
     fn reasoning_summary_block_returns_reasoning_cell_when_feature_disabled() {
-        let mut config = test_config();
-        config.model_family.reasoning_summary_format = ReasoningSummaryFormat::Experimental;
-
-        let cell =
-            new_reasoning_summary_block("Detailed reasoning goes here.".to_string(), &config);
+        let cell = new_reasoning_summary_block("Detailed reasoning goes here.".to_string());
 
         let rendered = render_transcript(cell.as_ref());
         assert_eq!(rendered, vec!["• Detailed reasoning goes here."]);
     }
 
+    #[tokio::test]
+    async fn reasoning_summary_block_respects_config_overrides() {
+        let mut config = test_config().await;
+        config.model = Some("gpt-3.5-turbo".to_string());
+        config.model_supports_reasoning_summaries = Some(true);
+        let cell = new_reasoning_summary_block(
+            "**High level reasoning**\n\nDetailed reasoning goes here.".to_string(),
+        );
+
+        let rendered_display = render_lines(&cell.display_lines(80));
+        assert_eq!(rendered_display, vec!["• Detailed reasoning goes here."]);
+    }
+
     #[test]
     fn reasoning_summary_block_falls_back_when_header_is_missing() {
-        let mut config = test_config();
-        config.model_family.reasoning_summary_format = ReasoningSummaryFormat::Experimental;
-
-        let cell = new_reasoning_summary_block(
-            "**High level reasoning without closing".to_string(),
-            &config,
-        );
+        let cell =
+            new_reasoning_summary_block("**High level reasoning without closing".to_string());
 
         let rendered = render_transcript(cell.as_ref());
         assert_eq!(rendered, vec!["• **High level reasoning without closing"]);
@@ -2319,20 +2983,14 @@ mod tests {
 
     #[test]
     fn reasoning_summary_block_falls_back_when_summary_is_missing() {
-        let mut config = test_config();
-        config.model_family.reasoning_summary_format = ReasoningSummaryFormat::Experimental;
-
-        let cell = new_reasoning_summary_block(
-            "**High level reasoning without closing**".to_string(),
-            &config,
-        );
+        let cell =
+            new_reasoning_summary_block("**High level reasoning without closing**".to_string());
 
         let rendered = render_transcript(cell.as_ref());
         assert_eq!(rendered, vec!["• High level reasoning without closing"]);
 
         let cell = new_reasoning_summary_block(
             "**High level reasoning without closing**\n\n  ".to_string(),
-            &config,
         );
 
         let rendered = render_transcript(cell.as_ref());
@@ -2341,12 +2999,8 @@ mod tests {
 
     #[test]
     fn reasoning_summary_block_splits_header_and_summary_when_present() {
-        let mut config = test_config();
-        config.model_family.reasoning_summary_format = ReasoningSummaryFormat::Experimental;
-
         let cell = new_reasoning_summary_block(
             "**High level plan**\n\nWe should fix the bug next.".to_string(),
-            &config,
         );
 
         let rendered_display = render_lines(&cell.display_lines(80));

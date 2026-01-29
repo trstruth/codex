@@ -1,10 +1,8 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use crate::client_common::tools::ToolSpec;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
+use crate::sandboxing::SandboxPermissions;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -12,12 +10,16 @@ use crate::tools::registry::ConfiguredToolSpec;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::spec::ToolsConfig;
 use crate::tools::spec::build_specs;
+use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::ShellToolCallParams;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tracing::instrument;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ToolCall {
     pub tool_name: String,
     pub call_id: String,
@@ -33,8 +35,9 @@ impl ToolRouter {
     pub fn from_config(
         config: &ToolsConfig,
         mcp_tools: Option<HashMap<String, mcp_types::Tool>>,
+        dynamic_tools: &[DynamicToolSpec],
     ) -> Self {
-        let builder = build_specs(config, mcp_tools);
+        let builder = build_specs(config, mcp_tools, dynamic_tools);
         let (specs, registry) = builder.build();
 
         Self { registry, specs }
@@ -54,6 +57,7 @@ impl ToolRouter {
             .any(|config| config.spec.name() == tool_name)
     }
 
+    #[instrument(level = "trace", skip_all, err)]
     pub async fn build_tool_call(
         session: &Session,
         item: ResponseItem,
@@ -76,15 +80,10 @@ impl ToolRouter {
                         },
                     }))
                 } else {
-                    let payload = if name == "unified_exec" {
-                        ToolPayload::UnifiedExec { arguments }
-                    } else {
-                        ToolPayload::Function { arguments }
-                    };
                     Ok(Some(ToolCall {
                         tool_name: name,
                         call_id,
-                        payload,
+                        payload: ToolPayload::Function { arguments },
                     }))
                 }
             }
@@ -114,7 +113,8 @@ impl ToolRouter {
                             command: exec.command,
                             workdir: exec.working_directory,
                             timeout_ms: exec.timeout_ms,
-                            with_escalated_permissions: None,
+                            sandbox_permissions: Some(SandboxPermissions::UseDefault),
+                            prefix_rule: None,
                             justification: None,
                         };
                         Ok(Some(ToolCall {
@@ -129,6 +129,7 @@ impl ToolRouter {
         }
     }
 
+    #[instrument(level = "trace", skip_all, err)]
     pub async fn dispatch_tool_call(
         &self,
         session: Arc<Session>,

@@ -1,6 +1,5 @@
 use anyhow::Context;
-use codex_core::ConversationManager;
-use codex_core::NewConversation;
+use codex_core::features::Feature;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::ExecCommandEndEvent;
 use codex_core::protocol::ExecCommandSource;
@@ -9,7 +8,6 @@ use codex_core::protocol::Op;
 use codex_core::protocol::SandboxPolicy;
 use codex_core::protocol::TurnAbortReason;
 use core_test_support::assert_regex_match;
-use core_test_support::load_default_config_for_test;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -37,20 +35,17 @@ async fn user_shell_cmd_ls_and_cat_in_temp_dir() {
         .await
         .expect("write temp file");
 
-    // Load config and pin cwd to the temp dir so ls/cat operate there.
-    let codex_home = TempDir::new().unwrap();
-    let mut config = load_default_config_for_test(&codex_home);
-    config.cwd = cwd.path().to_path_buf();
-
-    let conversation_manager =
-        ConversationManager::with_auth(codex_core::CodexAuth::from_api_key("dummy"));
-    let NewConversation {
-        conversation: codex,
-        ..
-    } = conversation_manager
-        .new_conversation(config)
+    // Pin cwd to the temp dir so ls/cat operate there.
+    let server = start_mock_server().await;
+    let cwd_path = cwd.path().to_path_buf();
+    let mut builder = test_codex().with_config(move |config| {
+        config.cwd = cwd_path;
+    });
+    let codex = builder
+        .build(&server)
         .await
-        .expect("create new conversation");
+        .expect("create new conversation")
+        .codex;
 
     // 1) shell command should list the file
     let list_cmd = "ls".to_string();
@@ -97,17 +92,13 @@ async fn user_shell_cmd_ls_and_cat_in_temp_dir() {
 #[tokio::test]
 async fn user_shell_cmd_can_be_interrupted() {
     // Set up isolated config and conversation.
-    let codex_home = TempDir::new().unwrap();
-    let config = load_default_config_for_test(&codex_home);
-    let conversation_manager =
-        ConversationManager::with_auth(codex_core::CodexAuth::from_api_key("dummy"));
-    let NewConversation {
-        conversation: codex,
-        ..
-    } = conversation_manager
-        .new_conversation(config)
+    let server = start_mock_server().await;
+    let mut builder = test_codex();
+    let codex = builder
+        .build(&server)
         .await
-        .expect("create new conversation");
+        .expect("create new conversation")
+        .codex;
 
     // Start a long-running command and then interrupt it.
     let sleep_cmd = "sleep 5".to_string();
@@ -131,7 +122,10 @@ async fn user_shell_cmd_can_be_interrupted() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_shell_command_history_is_persisted_and_shared_with_model() -> anyhow::Result<()> {
     let server = responses::start_mock_server().await;
-    let mut builder = core_test_support::test_codex::test_codex();
+    // Disable it to ease command matching.
+    let mut builder = core_test_support::test_codex::test_codex().with_config(move |config| {
+        config.features.disable(Feature::ShellSnapshot);
+    });
     let test = builder.build(&server).await?;
 
     #[cfg(windows)]
@@ -177,7 +171,7 @@ async fn user_shell_command_history_is_persisted_and_shared_with_model() -> anyh
     assert_eq!(end_event.exit_code, 0);
     assert_eq!(end_event.stdout.trim(), "not-set");
 
-    let _ = wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    let _ = wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let responses = vec![responses::sse(vec![
         responses::ev_response_created("resp-1"),
@@ -235,7 +229,7 @@ async fn user_shell_command_output_is_truncated_in_history() -> anyhow::Result<(
     .await;
     assert_eq!(end_event.exit_code, 0);
 
-    let _ = wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+    let _ = wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let responses = vec![responses::sse(vec![
         responses::ev_response_created("resp-1"),

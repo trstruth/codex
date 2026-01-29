@@ -13,8 +13,8 @@ workspace = true
 
 [dependencies]
 codex-git = { workspace = true }
-
-base64 = { workspace = true }
+codex-execpolicy = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
 codex-utils-image = { workspace = true }
 icu_decimal = { workspace = true }
 icu_locale_core = { workspace = true }

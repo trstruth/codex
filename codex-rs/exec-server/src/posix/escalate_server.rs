@@ -10,6 +10,8 @@ use path_absolutize::Absolutize as _;
 
 use codex_core::SandboxState;
 use codex_core::exec::process_exec_tool_call;
+use codex_core::protocol_config_types::WindowsSandboxLevel;
+use codex_core::sandboxing::SandboxPermissions;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
@@ -85,7 +87,8 @@ impl EscalateServer {
                 cwd: PathBuf::from(&workdir),
                 expiration: ExecExpiration::Cancellation(cancel_rx),
                 env,
-                with_escalated_permissions: None,
+                sandbox_permissions: SandboxPermissions::UseDefault,
+                windows_sandbox_level: WindowsSandboxLevel::Disabled,
                 justification: None,
                 arg0: None,
             },
@@ -258,12 +261,18 @@ mod tests {
             }),
         ));
 
+        let mut env = HashMap::new();
+        for i in 0..10 {
+            let value = "A".repeat(1024);
+            env.insert(format!("CODEX_TEST_VAR{i}"), value);
+        }
+
         client
             .send(EscalateRequest {
                 file: PathBuf::from("/bin/echo"),
                 argv: vec!["echo".to_string()],
                 workdir: PathBuf::from("/tmp"),
-                env: HashMap::new(),
+                env,
             })
             .await?;
 

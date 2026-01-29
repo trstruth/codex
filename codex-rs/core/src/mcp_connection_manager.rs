@@ -12,9 +12,9 @@ use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 
+use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::auth::McpAuthStatusEntry;
 use anyhow::Context;
 use anyhow::Result;
@@ -55,9 +55,11 @@ use serde::Serialize;
 use serde_json::json;
 use sha1::Digest;
 use sha1::Sha1;
+use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::instrument;
 use tracing::warn;
 
 use crate::codex::INITIAL_SUBMIT_ID;
@@ -78,26 +80,60 @@ pub const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default timeout for individual tool calls.
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The Responses API requires tool names to match `^[a-zA-Z0-9_-]+$`.
+/// MCP server/tool names are user-controlled, so sanitize the fully-qualified
+/// name we expose to the model by replacing any disallowed character with `_`.
+fn sanitize_responses_api_tool_name(name: &str) -> String {
+    let mut sanitized = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            sanitized.push(c);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    if sanitized.is_empty() {
+        "_".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn sha1_hex(s: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(s.as_bytes());
+    let sha1 = hasher.finalize();
+    format!("{sha1:x}")
+}
+
 fn qualify_tools<I>(tools: I) -> HashMap<String, ToolInfo>
 where
     I: IntoIterator<Item = ToolInfo>,
 {
     let mut used_names = HashSet::new();
+    let mut seen_raw_names = HashSet::new();
     let mut qualified_tools = HashMap::new();
     for tool in tools {
-        let mut qualified_name = format!(
+        let qualified_name_raw = format!(
             "mcp{}{}{}{}",
             MCP_TOOL_NAME_DELIMITER, tool.server_name, MCP_TOOL_NAME_DELIMITER, tool.tool_name
         );
+        if !seen_raw_names.insert(qualified_name_raw.clone()) {
+            warn!("skipping duplicated tool {}", qualified_name_raw);
+            continue;
+        }
+
+        // Start from a "pretty" name (sanitized), then deterministically disambiguate on
+        // collisions by appending a hash of the *raw* (unsanitized) qualified name. This
+        // ensures tools like `foo.bar` and `foo_bar` don't collapse to the same key.
+        let mut qualified_name = sanitize_responses_api_tool_name(&qualified_name_raw);
+
+        // Enforce length constraints early; use the raw name for the hash input so the
+        // output remains stable even when sanitization changes.
         if qualified_name.len() > MAX_TOOL_NAME_LENGTH {
-            let mut hasher = Sha1::new();
-            hasher.update(qualified_name.as_bytes());
-            let sha1 = hasher.finalize();
-            let sha1_str = format!("{sha1:x}");
-
-            // Truncate to make room for the hash suffix
+            let sha1_str = sha1_hex(&qualified_name_raw);
             let prefix_len = MAX_TOOL_NAME_LENGTH - sha1_str.len();
-
             qualified_name = format!("{}{}", &qualified_name[..prefix_len], sha1_str);
         }
 
@@ -118,6 +154,8 @@ pub(crate) struct ToolInfo {
     pub(crate) server_name: String,
     pub(crate) tool_name: String,
     pub(crate) tool: Tool,
+    pub(crate) connector_id: Option<String>,
+    pub(crate) connector_name: Option<String>,
 }
 
 type ResponderMap = HashMap<(String, RequestId), oneshot::Sender<ElicitationResponse>>;
@@ -128,7 +166,7 @@ struct ElicitationRequestManager {
 }
 
 impl ElicitationRequestManager {
-    fn resolve(
+    async fn resolve(
         &self,
         server_name: String,
         id: RequestId,
@@ -136,7 +174,7 @@ impl ElicitationRequestManager {
     ) -> Result<()> {
         self.requests
             .lock()
-            .map_err(|e| anyhow!("failed to lock elicitation requests: {e:?}"))?
+            .await
             .remove(&(server_name, id))
             .ok_or_else(|| anyhow!("elicitation request not found"))?
             .send(response)
@@ -151,7 +189,8 @@ impl ElicitationRequestManager {
             let server_name = server_name.clone();
             async move {
                 let (tx, rx) = oneshot::channel();
-                if let Ok(mut lock) = elicitation_requests.lock() {
+                {
+                    let mut lock = elicitation_requests.lock().await;
                     lock.insert((server_name.clone(), id.clone()), tx);
                 }
                 let _ = tx_event
@@ -179,6 +218,24 @@ struct ManagedClient {
     tool_filter: ToolFilter,
     tool_timeout: Option<Duration>,
     server_supports_sandbox_state_capability: bool,
+}
+
+impl ManagedClient {
+    /// Returns once the server has ack'd the sandbox state update.
+    async fn notify_sandbox_state_change(&self, sandbox_state: &SandboxState) -> Result<()> {
+        if !self.server_supports_sandbox_state_capability {
+            return Ok(());
+        }
+
+        let _response = self
+            .client
+            .send_custom_request(
+                MCP_SANDBOX_STATE_METHOD,
+                Some(serde_json::to_value(sandbox_state)?),
+            )
+            .await?;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -230,25 +287,15 @@ impl AsyncManagedClient {
 
     async fn notify_sandbox_state_change(&self, sandbox_state: &SandboxState) -> Result<()> {
         let managed = self.client().await?;
-        if !managed.server_supports_sandbox_state_capability {
-            return Ok(());
-        }
-
-        managed
-            .client
-            .send_custom_notification(
-                MCP_SANDBOX_STATE_NOTIFICATION,
-                Some(serde_json::to_value(sandbox_state)?),
-            )
-            .await
+        managed.notify_sandbox_state_change(sandbox_state).await
     }
 }
 
 pub const MCP_SANDBOX_STATE_CAPABILITY: &str = "codex/sandbox-state";
 
-/// Custom MCP notification for sandbox state updates.
+/// Custom MCP request to push sandbox state updates.
 /// When used, the `params` field of the notification is [`SandboxState`].
-pub const MCP_SANDBOX_STATE_NOTIFICATION: &str = "codex/sandbox-state/update";
+pub const MCP_SANDBOX_STATE_METHOD: &str = "codex/sandbox-state/update";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -268,11 +315,12 @@ pub(crate) struct McpConnectionManager {
 impl McpConnectionManager {
     pub async fn initialize(
         &mut self,
-        mcp_servers: HashMap<String, McpServerConfig>,
+        mcp_servers: &HashMap<String, McpServerConfig>,
         store_mode: OAuthCredentialsStoreMode,
         auth_entries: HashMap<String, McpAuthStatusEntry>,
         tx_event: Sender<Event>,
         cancel_token: CancellationToken,
+        initial_sandbox_state: SandboxState,
     ) {
         if cancel_token.is_cancelled() {
             return;
@@ -280,6 +328,7 @@ impl McpConnectionManager {
         let mut clients = HashMap::new();
         let mut join_set = JoinSet::new();
         let elicitation_requests = ElicitationRequestManager::default();
+        let mcp_servers = mcp_servers.clone();
         for (server_name, cfg) in mcp_servers.into_iter().filter(|(_, cfg)| cfg.enabled) {
             let cancel_token = cancel_token.child_token();
             let _ = emit_update(
@@ -301,13 +350,25 @@ impl McpConnectionManager {
             clients.insert(server_name.clone(), async_managed_client.clone());
             let tx_event = tx_event.clone();
             let auth_entry = auth_entries.get(&server_name).cloned();
+            let sandbox_state = initial_sandbox_state.clone();
             join_set.spawn(async move {
                 let outcome = async_managed_client.client().await;
                 if cancel_token.is_cancelled() {
                     return (server_name, Err(StartupOutcomeError::Cancelled));
                 }
                 let status = match &outcome {
-                    Ok(_) => McpStartupStatus::Ready,
+                    Ok(_) => {
+                        // Send sandbox state notification immediately after Ready
+                        if let Err(e) = async_managed_client
+                            .notify_sandbox_state_change(&sandbox_state)
+                            .await
+                        {
+                            warn!(
+                                "Failed to notify sandbox state to MCP server {server_name}: {e:#}",
+                            );
+                        }
+                        McpStartupStatus::Ready
+                    }
                     Err(error) => {
                         let error_str = mcp_init_error_display(
                             server_name.as_str(),
@@ -365,21 +426,44 @@ impl McpConnectionManager {
             .context("failed to get client")
     }
 
-    pub fn resolve_elicitation(
+    pub async fn resolve_elicitation(
         &self,
         server_name: String,
         id: RequestId,
         response: ElicitationResponse,
     ) -> Result<()> {
-        self.elicitation_requests.resolve(server_name, id, response)
+        self.elicitation_requests
+            .resolve(server_name, id, response)
+            .await
+    }
+
+    pub(crate) async fn wait_for_server_ready(&self, server_name: &str, timeout: Duration) -> bool {
+        let Some(async_managed_client) = self.clients.get(server_name) else {
+            return false;
+        };
+
+        match tokio::time::timeout(timeout, async_managed_client.client()).await {
+            Ok(Ok(_)) => true,
+            Ok(Err(_)) | Err(_) => false,
+        }
     }
 
     /// Returns a single map that contains all tools. Each key is the
     /// fully-qualified name for the tool.
+    #[instrument(level = "trace", skip_all)]
     pub async fn list_all_tools(&self) -> HashMap<String, ToolInfo> {
         let mut tools = HashMap::new();
-        for managed_client in self.clients.values() {
-            if let Ok(client) = managed_client.client().await {
+        for (server_name, managed_client) in &self.clients {
+            let client = if server_name == CODEX_APPS_MCP_SERVER_NAME {
+                // Avoid blocking on codex_apps_mcp startup; use tools only when ready.
+                match managed_client.client.clone().now_or_never() {
+                    Some(Ok(client)) => Some(client),
+                    _ => None,
+                }
+            } else {
+                managed_client.client().await.ok()
+            };
+            if let Some(client) = client {
                 tools.extend(qualify_tools(filter_tools(
                     client.tools,
                     client.tool_filter,
@@ -838,14 +922,16 @@ async fn list_tools_for_client(
     client: &Arc<RmcpClient>,
     timeout: Option<Duration>,
 ) -> Result<Vec<ToolInfo>> {
-    let resp = client.list_tools(None, timeout).await?;
+    let resp = client.list_tools_with_connector_ids(None, timeout).await?;
     Ok(resp
         .tools
         .into_iter()
         .map(|tool| ToolInfo {
             server_name: server_name.to_owned(),
-            tool_name: tool.name.clone(),
-            tool,
+            tool_name: tool.tool.name.clone(),
+            tool: tool.tool,
+            connector_id: tool.connector_id,
+            connector_name: tool.connector_name,
         })
         .collect())
 }
@@ -943,6 +1029,8 @@ mod tests {
                 output_schema: None,
                 title: None,
             },
+            connector_id: None,
+            connector_name: None,
         }
     }
 
@@ -1006,6 +1094,28 @@ mod tests {
         assert_eq!(
             keys[1],
             "mcp__my_server__yet_anot419a82a89325c1b477274a41f8c65ea5f3a7f341"
+        );
+    }
+
+    #[test]
+    fn test_qualify_tools_sanitizes_invalid_characters() {
+        let tools = vec![create_test_tool("server.one", "tool.two")];
+
+        let qualified_tools = qualify_tools(tools);
+
+        assert_eq!(qualified_tools.len(), 1);
+        let (qualified_name, tool) = qualified_tools.into_iter().next().expect("one tool");
+        assert_eq!(qualified_name, "mcp__server_one__tool_two");
+
+        // The key is sanitized for OpenAI, but we keep original parts for the actual MCP call.
+        assert_eq!(tool.server_name, "server.one");
+        assert_eq!(tool.tool_name, "tool.two");
+
+        assert!(
+            qualified_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "qualified name must be Responses API compatible: {qualified_name:?}"
         );
     }
 
@@ -1088,10 +1198,12 @@ mod tests {
                     env_http_headers: None,
                 },
                 enabled: true,
+                disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                scopes: None,
             },
             auth_status: McpAuthStatus::Unsupported,
         };
@@ -1132,10 +1244,12 @@ mod tests {
                     env_http_headers: None,
                 },
                 enabled: true,
+                disabled_reason: None,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
                 enabled_tools: None,
                 disabled_tools: None,
+                scopes: None,
             },
             auth_status: McpAuthStatus::Unsupported,
         };

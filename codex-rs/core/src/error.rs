@@ -1,4 +1,3 @@
-use crate::codex::ProcessedResponseItem;
 use crate::exec::ExecToolCallOutput;
 use crate::token_data::KnownPlan;
 use crate::token_data::PlanType;
@@ -9,7 +8,7 @@ use chrono::Datelike;
 use chrono::Local;
 use chrono::Utc;
 use codex_async_utils::CancelErr;
-use codex_protocol::ConversationId;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::RateLimitSnapshot;
@@ -23,7 +22,7 @@ use tokio::task::JoinError;
 pub type Result<T> = std::result::Result<T, CodexErr>;
 
 /// Limit UI error messages to a reasonable size while keeping useful context.
-const ERROR_MESSAGE_UI_MAX_BYTES: usize = 2 * 1024; // 4 KiB
+const ERROR_MESSAGE_UI_MAX_BYTES: usize = 2 * 1024; // 2 KiB
 
 #[derive(Error, Debug)]
 pub enum SandboxErr {
@@ -59,11 +58,8 @@ pub enum SandboxErr {
 
 #[derive(Error, Debug)]
 pub enum CodexErr {
-    // todo(aibrahim): git rid of this error carrying the dangling artifacts
     #[error("turn aborted. Something went wrong? Hit `/feedback` to report the issue.")]
-    TurnAborted {
-        dangling_artifacts: Vec<ProcessedResponseItem>,
-    },
+    TurnAborted,
 
     /// Returned by ResponsesClient when the SSE stream disconnects or errors out **after** the HTTP
     /// handshake has succeeded but **before** it finished emitting `response.completed`.
@@ -75,12 +71,15 @@ pub enum CodexErr {
     Stream(String, Option<Duration>),
 
     #[error(
-        "Codex ran out of room in the model's context window. Start a new conversation or clear earlier history before retrying."
+        "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying."
     )]
     ContextWindowExceeded,
 
-    #[error("no conversation with id: {0}")]
-    ConversationNotFound(ConversationId),
+    #[error("no thread with id: {0}")]
+    ThreadNotFound(ThreadId),
+
+    #[error("agent thread limit reached (max {max_threads})")]
+    AgentLimitReached { max_threads: usize },
 
     #[error("session configured event was not the first event in the stream")]
     SessionConfiguredNotFirstEvent,
@@ -102,6 +101,14 @@ pub enum CodexErr {
     /// Unexpected HTTP status code.
     #[error("{0}")]
     UnexpectedStatus(UnexpectedResponseError),
+
+    /// Invalid request.
+    #[error("{0}")]
+    InvalidRequest(String),
+
+    /// Invalid image.
+    #[error("Image poisoning")]
+    InvalidImageRequest(),
 
     #[error("{0}")]
     UsageLimitReached(UsageLimitReachedError),
@@ -173,8 +180,44 @@ pub enum CodexErr {
 
 impl From<CancelErr> for CodexErr {
     fn from(_: CancelErr) -> Self {
-        CodexErr::TurnAborted {
-            dangling_artifacts: Vec::new(),
+        CodexErr::TurnAborted
+    }
+}
+
+impl CodexErr {
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            CodexErr::TurnAborted
+            | CodexErr::Interrupted
+            | CodexErr::EnvVar(_)
+            | CodexErr::Fatal(_)
+            | CodexErr::UsageNotIncluded
+            | CodexErr::QuotaExceeded
+            | CodexErr::InvalidImageRequest()
+            | CodexErr::InvalidRequest(_)
+            | CodexErr::RefreshTokenFailed(_)
+            | CodexErr::UnsupportedOperation(_)
+            | CodexErr::Sandbox(_)
+            | CodexErr::LandlockSandboxExecutableNotProvided
+            | CodexErr::RetryLimit(_)
+            | CodexErr::ContextWindowExceeded
+            | CodexErr::ThreadNotFound(_)
+            | CodexErr::AgentLimitReached { .. }
+            | CodexErr::Spawn
+            | CodexErr::SessionConfiguredNotFirstEvent
+            | CodexErr::UsageLimitReached(_) => false,
+            CodexErr::Stream(..)
+            | CodexErr::Timeout
+            | CodexErr::UnexpectedStatus(_)
+            | CodexErr::ResponseStreamFailed(_)
+            | CodexErr::ConnectionFailed(_)
+            | CodexErr::InternalServerError
+            | CodexErr::InternalAgentDied
+            | CodexErr::Io(_)
+            | CodexErr::Json(_)
+            | CodexErr::TokioJoin(_) => true,
+            #[cfg(target_os = "linux")]
+            CodexErr::LandlockRuleset(_) | CodexErr::LandlockPathFd(_) => false,
         }
     }
 }
@@ -238,6 +281,7 @@ pub enum RefreshTokenFailedReason {
 pub struct UnexpectedResponseError {
     pub status: StatusCode,
     pub body: String,
+    pub url: Option<String>,
     pub request_id: Option<String>,
 }
 
@@ -254,7 +298,11 @@ impl UnexpectedResponseError {
             return None;
         }
 
-        let mut message = format!("{CLOUDFLARE_BLOCKED_MESSAGE} (status {})", self.status);
+        let status = self.status;
+        let mut message = format!("{CLOUDFLARE_BLOCKED_MESSAGE} (status {status})");
+        if let Some(url) = &self.url {
+            message.push_str(&format!(", url: {url}"));
+        }
         if let Some(id) = &self.request_id {
             message.push_str(&format!(", request id: {id}"));
         }
@@ -268,16 +316,16 @@ impl std::fmt::Display for UnexpectedResponseError {
         if let Some(friendly) = self.friendly_message() {
             write!(f, "{friendly}")
         } else {
-            write!(
-                f,
-                "unexpected status {}: {}{}",
-                self.status,
-                self.body,
-                self.request_id
-                    .as_ref()
-                    .map(|id| format!(", request id: {id}"))
-                    .unwrap_or_default()
-            )
+            let status = self.status;
+            let body = &self.body;
+            let mut message = format!("unexpected status {status}: {body}");
+            if let Some(url) = &self.url {
+                message.push_str(&format!(", url: {url}"));
+            }
+            if let Some(id) = &self.request_id {
+                message.push_str(&format!(", request id: {id}"));
+            }
+            write!(f, "{message}")
         }
     }
 }
@@ -453,9 +501,9 @@ impl CodexErr {
             CodexErr::SessionConfiguredNotFirstEvent
             | CodexErr::InternalServerError
             | CodexErr::InternalAgentDied => CodexErrorInfo::InternalServerError,
-            CodexErr::UnsupportedOperation(_) | CodexErr::ConversationNotFound(_) => {
-                CodexErrorInfo::BadRequest
-            }
+            CodexErr::UnsupportedOperation(_)
+            | CodexErr::ThreadNotFound(_)
+            | CodexErr::AgentLimitReached { .. } => CodexErrorInfo::BadRequest,
             CodexErr::Sandbox(_) => CodexErrorInfo::SandboxError,
             _ => CodexErrorInfo::Other,
         }
@@ -557,6 +605,7 @@ mod tests {
                 resets_at: Some(secondary_reset_at),
             }),
             credits: None,
+            plan_type: None,
         }
     }
 
@@ -786,12 +835,16 @@ mod tests {
             status: StatusCode::FORBIDDEN,
             body: "<html><body>Cloudflare error: Sorry, you have been blocked</body></html>"
                 .to_string(),
+            url: Some("http://example.com/blocked".to_string()),
             request_id: Some("ray-id".to_string()),
         };
         let status = StatusCode::FORBIDDEN.to_string();
+        let url = "http://example.com/blocked";
         assert_eq!(
             err.to_string(),
-            format!("{CLOUDFLARE_BLOCKED_MESSAGE} (status {status}), request id: ray-id")
+            format!(
+                "{CLOUDFLARE_BLOCKED_MESSAGE} (status {status}), url: {url}, request id: ray-id"
+            )
         );
     }
 
@@ -800,12 +853,14 @@ mod tests {
         let err = UnexpectedResponseError {
             status: StatusCode::FORBIDDEN,
             body: "plain text error".to_string(),
+            url: Some("http://example.com/plain".to_string()),
             request_id: None,
         };
         let status = StatusCode::FORBIDDEN.to_string();
+        let url = "http://example.com/plain";
         assert_eq!(
             err.to_string(),
-            format!("unexpected status {status}: plain text error")
+            format!("unexpected status {status}: plain text error, url: {url}")
         );
     }
 

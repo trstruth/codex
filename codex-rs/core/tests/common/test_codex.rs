@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use codex_core::CodexAuth;
-use codex_core::CodexConversation;
-use codex_core::ConversationManager;
+use codex_core::CodexThread;
 use codex_core::ModelProviderInfo;
+use codex_core::ThreadManager;
+use codex_core::WireApi;
 use codex_core::built_in_model_providers;
 use codex_core::config::Config;
 use codex_core::features::Feature;
-use codex_core::model_family::find_family_for_model;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
@@ -24,10 +24,15 @@ use tempfile::TempDir;
 use wiremock::MockServer;
 
 use crate::load_default_config_for_test;
+use crate::responses::WebSocketTestServer;
 use crate::responses::start_mock_server;
+use crate::streaming_sse::StreamingSseServer;
 use crate::wait_for_event;
+use wiremock::Match;
+use wiremock::matchers::path_regex;
 
 type ConfigMutator = dyn FnOnce(&mut Config) + Send;
+type PreBuildHook = dyn FnOnce(&Path) + Send + 'static;
 
 /// A collection of different ways the model can output an apply_patch call
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -36,6 +41,7 @@ pub enum ApplyPatchModelOutput {
     Function,
     Shell,
     ShellViaHeredoc,
+    ShellCommandViaHeredoc,
 }
 
 /// A collection of different ways the model can output an apply_patch call
@@ -50,6 +56,8 @@ pub enum ShellModelOutput {
 pub struct TestCodexBuilder {
     config_mutators: Vec<Box<ConfigMutator>>,
     auth: CodexAuth,
+    pre_build_hooks: Vec<Box<PreBuildHook>>,
+    home: Option<Arc<TempDir>>,
 }
 
 impl TestCodexBuilder {
@@ -69,14 +77,60 @@ impl TestCodexBuilder {
     pub fn with_model(self, model: &str) -> Self {
         let new_model = model.to_string();
         self.with_config(move |config| {
-            config.model = new_model.clone();
-            config.model_family = find_family_for_model(&new_model).expect("model family");
+            config.model = Some(new_model.clone());
         })
     }
 
+    pub fn with_pre_build_hook<F>(mut self, hook: F) -> Self
+    where
+        F: FnOnce(&Path) + Send + 'static,
+    {
+        self.pre_build_hooks.push(Box::new(hook));
+        self
+    }
+
+    pub fn with_home(mut self, home: Arc<TempDir>) -> Self {
+        self.home = Some(home);
+        self
+    }
+
     pub async fn build(&mut self, server: &wiremock::MockServer) -> anyhow::Result<TestCodex> {
-        let home = Arc::new(TempDir::new()?);
+        let home = match self.home.clone() {
+            Some(home) => home,
+            None => Arc::new(TempDir::new()?),
+        };
         self.build_with_home(server, home, None).await
+    }
+
+    pub async fn build_with_streaming_server(
+        &mut self,
+        server: &StreamingSseServer,
+    ) -> anyhow::Result<TestCodex> {
+        let base_url = server.uri();
+        let home = match self.home.clone() {
+            Some(home) => home,
+            None => Arc::new(TempDir::new()?),
+        };
+        self.build_with_home_and_base_url(format!("{base_url}/v1"), home, None)
+            .await
+    }
+
+    pub async fn build_with_websocket_server(
+        &mut self,
+        server: &WebSocketTestServer,
+    ) -> anyhow::Result<TestCodex> {
+        let base_url = format!("{}/v1", server.uri());
+        let home = match self.home.clone() {
+            Some(home) => home,
+            None => Arc::new(TempDir::new()?),
+        };
+        let base_url_clone = base_url.clone();
+        self.config_mutators.push(Box::new(move |config| {
+            config.model_provider.base_url = Some(base_url_clone);
+            config.model_provider.wire_api = WireApi::ResponsesWebsocket;
+        }));
+        self.build_with_home_and_base_url(base_url, home, None)
+            .await
     }
 
     pub async fn resume(
@@ -94,49 +148,74 @@ impl TestCodexBuilder {
         home: Arc<TempDir>,
         resume_from: Option<PathBuf>,
     ) -> anyhow::Result<TestCodex> {
-        let (config, cwd) = self.prepare_config(server, &home).await?;
+        let base_url = format!("{}/v1", server.uri());
+        let (config, cwd) = self.prepare_config(base_url, &home).await?;
+        self.build_from_config(config, cwd, home, resume_from).await
+    }
 
+    async fn build_with_home_and_base_url(
+        &mut self,
+        base_url: String,
+        home: Arc<TempDir>,
+        resume_from: Option<PathBuf>,
+    ) -> anyhow::Result<TestCodex> {
+        let (config, cwd) = self.prepare_config(base_url, &home).await?;
+        self.build_from_config(config, cwd, home, resume_from).await
+    }
+
+    async fn build_from_config(
+        &mut self,
+        config: Config,
+        cwd: Arc<TempDir>,
+        home: Arc<TempDir>,
+        resume_from: Option<PathBuf>,
+    ) -> anyhow::Result<TestCodex> {
         let auth = self.auth.clone();
-        let conversation_manager = ConversationManager::with_auth(auth.clone());
+        let thread_manager = ThreadManager::with_models_provider_and_home(
+            auth.clone(),
+            config.model_provider.clone(),
+            config.codex_home.clone(),
+        );
+        let thread_manager = Arc::new(thread_manager);
 
         let new_conversation = match resume_from {
             Some(path) => {
                 let auth_manager = codex_core::AuthManager::from_auth_for_testing(auth);
-                conversation_manager
-                    .resume_conversation_from_rollout(config.clone(), path, auth_manager)
+                thread_manager
+                    .resume_thread_from_rollout(config.clone(), path, auth_manager)
                     .await?
             }
-            None => {
-                conversation_manager
-                    .new_conversation(config.clone())
-                    .await?
-            }
+            None => thread_manager.start_thread(config.clone()).await?,
         };
 
         Ok(TestCodex {
             home,
             cwd,
             config,
-            codex: new_conversation.conversation,
+            codex: new_conversation.thread,
             session_configured: new_conversation.session_configured,
+            thread_manager,
         })
     }
 
     async fn prepare_config(
         &mut self,
-        server: &wiremock::MockServer,
+        base_url: String,
         home: &TempDir,
     ) -> anyhow::Result<(Config, Arc<TempDir>)> {
         let model_provider = ModelProviderInfo {
-            base_url: Some(format!("{}/v1", server.uri())),
+            base_url: Some(base_url),
             ..built_in_model_providers()["openai"].clone()
         };
         let cwd = Arc::new(TempDir::new()?);
-        let mut config = load_default_config_for_test(home);
+        let mut config = load_default_config_for_test(home).await;
         config.cwd = cwd.path().to_path_buf();
         config.model_provider = model_provider;
-        if let Ok(cmd) = assert_cmd::Command::cargo_bin("codex") {
-            config.codex_linux_sandbox_exe = Some(PathBuf::from(cmd.get_program().to_os_string()));
+        for hook in self.pre_build_hooks.drain(..) {
+            hook(home.path());
+        }
+        if let Ok(path) = codex_utils_cargo_bin::cargo_bin("codex") {
+            config.codex_linux_sandbox_exe = Some(path);
         }
 
         let mut mutators = vec![];
@@ -158,14 +237,19 @@ impl TestCodexBuilder {
 pub struct TestCodex {
     pub home: Arc<TempDir>,
     pub cwd: Arc<TempDir>,
-    pub codex: Arc<CodexConversation>,
+    pub codex: Arc<CodexThread>,
     pub session_configured: SessionConfiguredEvent,
     pub config: Config,
+    pub thread_manager: Arc<ThreadManager>,
 }
 
 impl TestCodex {
     pub fn cwd_path(&self) -> &Path {
         self.cwd.path()
+    }
+
+    pub fn codex_home_path(&self) -> &Path {
+        self.config.codex_home.as_path()
     }
 
     pub fn workspace_path(&self, rel: impl AsRef<Path>) -> PathBuf {
@@ -201,6 +285,7 @@ impl TestCodex {
             .submit(Op::UserTurn {
                 items: vec![UserInput::Text {
                     text: prompt.into(),
+                    text_elements: Vec::new(),
                 }],
                 final_output_json_schema: None,
                 cwd: self.cwd.path().to_path_buf(),
@@ -209,11 +294,13 @@ impl TestCodex {
                 model: session_model,
                 effort: None,
                 summary: ReasoningSummary::Auto,
+                collaboration_mode: None,
+                personality: None,
             })
             .await?;
 
         wait_for_event(&self.codex, |event| {
-            matches!(event, EventMsg::TaskComplete(_))
+            matches!(event, EventMsg::TurnComplete(_))
         })
         .await;
         Ok(())
@@ -271,12 +358,17 @@ impl TestCodexHarness {
     }
 
     pub async fn request_bodies(&self) -> Vec<Value> {
+        let path_matcher = path_regex(".*/responses$");
         self.server
             .received_requests()
             .await
-            .expect("requests")
+            .expect("mock server should not fail")
             .into_iter()
-            .map(|req| serde_json::from_slice(&req.body).expect("request body json"))
+            .filter(|req| path_matcher.matches(req))
+            .map(|req| {
+                req.body_json::<Value>()
+                    .expect("request body to be valid JSON")
+            })
             .collect()
     }
 
@@ -312,7 +404,10 @@ impl TestCodexHarness {
             ApplyPatchModelOutput::Freeform => self.custom_tool_call_output(call_id).await,
             ApplyPatchModelOutput::Function
             | ApplyPatchModelOutput::Shell
-            | ApplyPatchModelOutput::ShellViaHeredoc => self.function_call_stdout(call_id).await,
+            | ApplyPatchModelOutput::ShellViaHeredoc
+            | ApplyPatchModelOutput::ShellCommandViaHeredoc => {
+                self.function_call_stdout(call_id).await
+            }
         }
     }
 }
@@ -351,5 +446,7 @@ pub fn test_codex() -> TestCodexBuilder {
     TestCodexBuilder {
         config_mutators: vec![],
         auth: CodexAuth::from_api_key("dummy"),
+        pre_build_hooks: vec![],
+        home: None,
     }
 }

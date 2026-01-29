@@ -109,17 +109,45 @@ client_request_definitions! {
         params: v2::ThreadResumeParams,
         response: v2::ThreadResumeResponse,
     },
+    ThreadFork => "thread/fork" {
+        params: v2::ThreadForkParams,
+        response: v2::ThreadForkResponse,
+    },
     ThreadArchive => "thread/archive" {
         params: v2::ThreadArchiveParams,
         response: v2::ThreadArchiveResponse,
+    },
+    ThreadUnarchive => "thread/unarchive" {
+        params: v2::ThreadUnarchiveParams,
+        response: v2::ThreadUnarchiveResponse,
+    },
+    ThreadRollback => "thread/rollback" {
+        params: v2::ThreadRollbackParams,
+        response: v2::ThreadRollbackResponse,
     },
     ThreadList => "thread/list" {
         params: v2::ThreadListParams,
         response: v2::ThreadListResponse,
     },
-    ThreadCompact => "thread/compact" {
-        params: v2::ThreadCompactParams,
-        response: v2::ThreadCompactResponse,
+    ThreadLoadedList => "thread/loaded/list" {
+        params: v2::ThreadLoadedListParams,
+        response: v2::ThreadLoadedListResponse,
+    },
+    ThreadRead => "thread/read" {
+        params: v2::ThreadReadParams,
+        response: v2::ThreadReadResponse,
+    },
+    SkillsList => "skills/list" {
+        params: v2::SkillsListParams,
+        response: v2::SkillsListResponse,
+    },
+    AppsList => "app/list" {
+        params: v2::AppsListParams,
+        response: v2::AppsListResponse,
+    },
+    SkillsConfigWrite => "skills/config/write" {
+        params: v2::SkillsConfigWriteParams,
+        response: v2::SkillsConfigWriteResponse,
     },
     TurnStart => "turn/start" {
         params: v2::TurnStartParams,
@@ -131,12 +159,32 @@ client_request_definitions! {
     },
     ReviewStart => "review/start" {
         params: v2::ReviewStartParams,
-        response: v2::TurnStartResponse,
+        response: v2::ReviewStartResponse,
     },
 
     ModelList => "model/list" {
         params: v2::ModelListParams,
         response: v2::ModelListResponse,
+    },
+    /// EXPERIMENTAL - list collaboration mode presets.
+    CollaborationModeList => "collaborationMode/list" {
+        params: v2::CollaborationModeListParams,
+        response: v2::CollaborationModeListResponse,
+    },
+
+    McpServerOauthLogin => "mcpServer/oauth/login" {
+        params: v2::McpServerOauthLoginParams,
+        response: v2::McpServerOauthLoginResponse,
+    },
+
+    McpServerRefresh => "config/mcpServer/reload" {
+        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        response: v2::McpServerRefreshResponse,
+    },
+
+    McpServerStatusList => "mcpServerStatus/list" {
+        params: v2::ListMcpServerStatusParams,
+        response: v2::ListMcpServerStatusResponse,
     },
 
     LoginAccount => "account/login/start" {
@@ -164,6 +212,30 @@ client_request_definitions! {
         response: v2::FeedbackUploadResponse,
     },
 
+    /// Execute a command (argv vector) under the server's sandbox.
+    OneOffCommandExec => "command/exec" {
+        params: v2::CommandExecParams,
+        response: v2::CommandExecResponse,
+    },
+
+    ConfigRead => "config/read" {
+        params: v2::ConfigReadParams,
+        response: v2::ConfigReadResponse,
+    },
+    ConfigValueWrite => "config/value/write" {
+        params: v2::ConfigValueWriteParams,
+        response: v2::ConfigWriteResponse,
+    },
+    ConfigBatchWrite => "config/batchWrite" {
+        params: v2::ConfigBatchWriteParams,
+        response: v2::ConfigWriteResponse,
+    },
+
+    ConfigRequirementsRead => "configRequirements/read" {
+        params: #[ts(type = "undefined")] #[serde(skip_serializing_if = "Option::is_none")] Option<()>,
+        response: v2::ConfigRequirementsReadResponse,
+    },
+
     GetAccount => "account/read" {
         params: v2::GetAccountParams,
         response: v2::GetAccountResponse,
@@ -187,6 +259,11 @@ client_request_definitions! {
     ResumeConversation {
         params: v1::ResumeConversationParams,
         response: v1::ResumeConversationResponse,
+    },
+    /// Fork a recorded Codex conversation into a new session.
+    ForkConversation {
+        params: v1::ForkConversationParams,
+        response: v1::ForkConversationResponse,
     },
     ArchiveConversation {
         params: v1::ArchiveConversationParams,
@@ -445,6 +522,18 @@ server_request_definitions! {
         response: v2::FileChangeRequestApprovalResponse,
     },
 
+    /// EXPERIMENTAL - Request input from the user for a tool call.
+    ToolRequestUserInput => "item/tool/requestUserInput" {
+        params: v2::ToolRequestUserInputParams,
+        response: v2::ToolRequestUserInputResponse,
+    },
+
+    /// Execute a dynamic tool call on the client.
+    DynamicToolCall => "item/tool/call" {
+        params: v2::DynamicToolCallParams,
+        response: v2::DynamicToolCallResponse,
+    },
+
     /// DEPRECATED APIs below
     /// Request to approve a patch.
     /// This request is used for Turns started via the legacy APIs (i.e. SendUserTurn, SendUserMessage).
@@ -489,18 +578,30 @@ server_notification_definitions! {
     /// NEW NOTIFICATIONS
     Error => "error" (v2::ErrorNotification),
     ThreadStarted => "thread/started" (v2::ThreadStartedNotification),
+    ThreadTokenUsageUpdated => "thread/tokenUsage/updated" (v2::ThreadTokenUsageUpdatedNotification),
     TurnStarted => "turn/started" (v2::TurnStartedNotification),
     TurnCompleted => "turn/completed" (v2::TurnCompletedNotification),
+    TurnDiffUpdated => "turn/diff/updated" (v2::TurnDiffUpdatedNotification),
+    TurnPlanUpdated => "turn/plan/updated" (v2::TurnPlanUpdatedNotification),
     ItemStarted => "item/started" (v2::ItemStartedNotification),
     ItemCompleted => "item/completed" (v2::ItemCompletedNotification),
+    /// This event is internal-only. Used by Codex Cloud.
+    RawResponseItemCompleted => "rawResponseItem/completed" (v2::RawResponseItemCompletedNotification),
     AgentMessageDelta => "item/agentMessage/delta" (v2::AgentMessageDeltaNotification),
     CommandExecutionOutputDelta => "item/commandExecution/outputDelta" (v2::CommandExecutionOutputDeltaNotification),
+    TerminalInteraction => "item/commandExecution/terminalInteraction" (v2::TerminalInteractionNotification),
+    FileChangeOutputDelta => "item/fileChange/outputDelta" (v2::FileChangeOutputDeltaNotification),
     McpToolCallProgress => "item/mcpToolCall/progress" (v2::McpToolCallProgressNotification),
+    McpServerOauthLoginCompleted => "mcpServer/oauthLogin/completed" (v2::McpServerOauthLoginCompletedNotification),
     AccountUpdated => "account/updated" (v2::AccountUpdatedNotification),
     AccountRateLimitsUpdated => "account/rateLimits/updated" (v2::AccountRateLimitsUpdatedNotification),
     ReasoningSummaryTextDelta => "item/reasoning/summaryTextDelta" (v2::ReasoningSummaryTextDeltaNotification),
     ReasoningSummaryPartAdded => "item/reasoning/summaryPartAdded" (v2::ReasoningSummaryPartAddedNotification),
     ReasoningTextDelta => "item/reasoning/textDelta" (v2::ReasoningTextDeltaNotification),
+    /// Deprecated: Use `ContextCompaction` item type instead.
+    ContextCompacted => "thread/compacted" (v2::ContextCompactedNotification),
+    DeprecationNotice => "deprecationNotice" (v2::DeprecationNoticeNotification),
+    ConfigWarning => "configWarning" (v2::ConfigWarningNotification),
 
     /// Notifies the user of world-writable directories on Windows, which cannot be protected by the sandbox.
     WindowsWorldWritableWarning => "windows/worldWritableWarning" (v2::WindowsWorldWritableWarningNotification),
@@ -526,7 +627,7 @@ client_notification_definitions! {
 mod tests {
     use super::*;
     use anyhow::Result;
-    use codex_protocol::ConversationId;
+    use codex_protocol::ThreadId;
     use codex_protocol::account::PlanType;
     use codex_protocol::parse_command::ParsedCommand;
     use codex_protocol::protocol::AskForApproval;
@@ -575,7 +676,7 @@ mod tests {
 
     #[test]
     fn conversation_id_serializes_as_plain_string() -> Result<()> {
-        let id = ConversationId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")?;
+        let id = ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")?;
 
         assert_eq!(
             json!("67e55044-10b1-426f-9247-bb680e5fe0c8"),
@@ -586,11 +687,10 @@ mod tests {
 
     #[test]
     fn conversation_id_deserializes_from_plain_string() -> Result<()> {
-        let id: ConversationId =
-            serde_json::from_value(json!("67e55044-10b1-426f-9247-bb680e5fe0c8"))?;
+        let id: ThreadId = serde_json::from_value(json!("67e55044-10b1-426f-9247-bb680e5fe0c8"))?;
 
         assert_eq!(
-            ConversationId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")?,
+            ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")?,
             id,
         );
         Ok(())
@@ -611,14 +711,13 @@ mod tests {
 
     #[test]
     fn serialize_server_request() -> Result<()> {
-        let conversation_id = ConversationId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")?;
+        let conversation_id = ThreadId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8")?;
         let params = v1::ExecCommandApprovalParams {
             conversation_id,
             call_id: "call-42".to_string(),
             command: vec!["echo".to_string(), "hello".to_string()],
             cwd: PathBuf::from("/tmp"),
             reason: Some("because tests".to_string()),
-            risk: None,
             parsed_cmd: vec![ParsedCommand::Unknown {
                 cmd: "echo hello".to_string(),
             }],
@@ -638,7 +737,6 @@ mod tests {
                     "command": ["echo", "hello"],
                     "cwd": "/tmp",
                     "reason": "because tests",
-                    "risk": null,
                     "parsedCmd": [
                         {
                             "type": "unknown",
@@ -664,6 +762,22 @@ mod tests {
         assert_eq!(
             json!({
                 "method": "account/rateLimits/read",
+                "id": 1,
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_config_requirements_read() -> Result<()> {
+        let request = ClientRequest::ConfigRequirementsRead {
+            request_id: RequestId::Integer(1),
+            params: None,
+        };
+        assert_eq!(
+            json!({
+                "method": "configRequirements/read",
                 "id": 1,
             }),
             serde_json::to_value(&request)?,
@@ -789,6 +903,23 @@ mod tests {
                     "limit": null,
                     "cursor": null
                 }
+            }),
+            serde_json::to_value(&request)?,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn serialize_list_collaboration_modes() -> Result<()> {
+        let request = ClientRequest::CollaborationModeList {
+            request_id: RequestId::Integer(7),
+            params: v2::CollaborationModeListParams::default(),
+        };
+        assert_eq!(
+            json!({
+                "method": "collaborationMode/list",
+                "id": 7,
+                "params": {}
             }),
             serde_json::to_value(&request)?,
         );

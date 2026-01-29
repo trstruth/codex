@@ -7,19 +7,18 @@
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::error::CodexErr;
-use crate::protocol::SandboxCommandAssessment;
 use crate::protocol::SandboxPolicy;
 use crate::sandboxing::CommandSpec;
 use crate::sandboxing::SandboxManager;
 use crate::sandboxing::SandboxTransformError;
 use crate::state::SessionServices;
+use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ReviewDecision;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::path::Path;
-use std::path::PathBuf;
 
 use futures::Future;
 use futures::future::BoxFuture;
@@ -50,28 +49,55 @@ impl ApprovalStore {
     }
 }
 
+/// Takes a vector of approval keys and returns a ReviewDecision.
+/// There will be one key in most cases, but apply_patch can modify multiple files at once.
+///
+/// - If all keys are already approved for session, we skip prompting.
+/// - If the user approves for session, we store the decision for each key individually
+///   so future requests touching any subset can also skip prompting.
 pub(crate) async fn with_cached_approval<K, F, Fut>(
     services: &SessionServices,
-    key: K,
+    // Name of the tool, used for metrics collection.
+    tool_name: &str,
+    keys: Vec<K>,
     fetch: F,
 ) -> ReviewDecision
 where
-    K: Serialize + Clone,
+    K: Serialize,
     F: FnOnce() -> Fut,
     Fut: Future<Output = ReviewDecision>,
 {
-    {
+    // To be defensive here, don't bother with checking the cache if keys are empty.
+    if keys.is_empty() {
+        return fetch().await;
+    }
+
+    let already_approved = {
         let store = services.tool_approvals.lock().await;
-        if let Some(decision) = store.get(&key) {
-            return decision;
-        }
+        keys.iter()
+            .all(|key| matches!(store.get(key), Some(ReviewDecision::ApprovedForSession)))
+    };
+
+    if already_approved {
+        return ReviewDecision::ApprovedForSession;
     }
 
     let decision = fetch().await;
 
+    services.otel_manager.counter(
+        "codex.approval.requested",
+        1,
+        &[
+            ("tool", tool_name),
+            ("approved", decision.to_opaque_string()),
+        ],
+    );
+
     if matches!(decision, ReviewDecision::ApprovedForSession) {
         let mut store = services.tool_approvals.lock().await;
-        store.put(key, ReviewDecision::ApprovedForSession);
+        for key in keys {
+            store.put(key, ReviewDecision::ApprovedForSession);
+        }
     }
 
     decision
@@ -83,42 +109,72 @@ pub(crate) struct ApprovalCtx<'a> {
     pub turn: &'a TurnContext,
     pub call_id: &'a str,
     pub retry_reason: Option<String>,
-    pub risk: Option<SandboxCommandAssessment>,
 }
 
 // Specifies what tool orchestrator should do with a given tool call.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ApprovalRequirement {
+pub(crate) enum ExecApprovalRequirement {
     /// No approval required for this tool call.
     Skip {
         /// The first attempt should skip sandboxing (e.g., when explicitly
         /// greenlit by policy).
         bypass_sandbox: bool,
+        /// Proposed execpolicy amendment to skip future approvals for similar commands
+        /// Only applies if the command fails to run in sandbox and codex prompts the user to run outside the sandbox.
+        proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
     },
-    /// Approval required for this tool call
-    NeedsApproval { reason: Option<String> },
-    /// Execution forbidden for this tool call
+    /// Approval required for this tool call.
+    NeedsApproval {
+        reason: Option<String>,
+        /// Proposed execpolicy amendment to skip future approvals for similar commands
+        /// See core/src/exec_policy.rs for more details on how proposed_execpolicy_amendment is determined.
+        proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
+    },
+    /// Execution forbidden for this tool call.
     Forbidden { reason: String },
+}
+
+impl ExecApprovalRequirement {
+    pub fn proposed_execpolicy_amendment(&self) -> Option<&ExecPolicyAmendment> {
+        match self {
+            Self::NeedsApproval {
+                proposed_execpolicy_amendment: Some(prefix),
+                ..
+            } => Some(prefix),
+            Self::Skip {
+                proposed_execpolicy_amendment: Some(prefix),
+                ..
+            } => Some(prefix),
+            _ => None,
+        }
+    }
 }
 
 /// - Never, OnFailure: do not ask
 /// - OnRequest: ask unless sandbox policy is DangerFullAccess
 /// - UnlessTrusted: always ask
-pub(crate) fn default_approval_requirement(
+pub(crate) fn default_exec_approval_requirement(
     policy: AskForApproval,
     sandbox_policy: &SandboxPolicy,
-) -> ApprovalRequirement {
+) -> ExecApprovalRequirement {
     let needs_approval = match policy {
         AskForApproval::Never | AskForApproval::OnFailure => false,
-        AskForApproval::OnRequest => !matches!(sandbox_policy, SandboxPolicy::DangerFullAccess),
+        AskForApproval::OnRequest => !matches!(
+            sandbox_policy,
+            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. }
+        ),
         AskForApproval::UnlessTrusted => true,
     };
 
     if needs_approval {
-        ApprovalRequirement::NeedsApproval { reason: None }
+        ExecApprovalRequirement::NeedsApproval {
+            reason: None,
+            proposed_execpolicy_amendment: None,
+        }
     } else {
-        ApprovalRequirement::Skip {
+        ExecApprovalRequirement::Skip {
             bypass_sandbox: false,
+            proposed_execpolicy_amendment: None,
         }
     }
 }
@@ -132,7 +188,14 @@ pub(crate) enum SandboxOverride {
 pub(crate) trait Approvable<Req> {
     type ApprovalKey: Hash + Eq + Clone + Debug + Serialize;
 
-    fn approval_key(&self, req: &Req) -> Self::ApprovalKey;
+    // In most cases (shell, unified_exec), a request will have a single approval key.
+    //
+    // However, apply_patch needs session "approve once, don't ask again" semantics that
+    // apply to multiple atomic targets (e.g., apply_patch approves per file path). Returning
+    // a list of keys lets the runtime treat the request as approved-for-session only if
+    // *all* keys are already approved, while still caching approvals per-key so future
+    // requests touching a subset can be auto-approved.
+    fn approval_keys(&self, req: &Req) -> Vec<Self::ApprovalKey>;
 
     /// Some tools may request to skip the sandbox on the first attempt
     /// (e.g., when the request explicitly asks for escalated permissions).
@@ -149,10 +212,9 @@ pub(crate) trait Approvable<Req> {
         matches!(policy, AskForApproval::Never)
     }
 
-    /// Override the default approval requirement. Return `Some(_)` to specify
-    /// a custom requirement, or `None` to fall back to
-    /// policy-based default.
-    fn approval_requirement(&self, _req: &Req) -> Option<ApprovalRequirement> {
+    /// Return `Some(_)` to specify a custom exec approval requirement, or `None`
+    /// to fall back to policy-based default.
+    fn exec_approval_requirement(&self, _req: &Req) -> Option<ExecApprovalRequirement> {
         None
     }
 
@@ -191,17 +253,6 @@ pub(crate) struct ToolCtx<'a> {
     pub tool_name: String,
 }
 
-/// Captures the command metadata needed to re-run a tool request without sandboxing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SandboxRetryData {
-    pub command: Vec<String>,
-    pub cwd: PathBuf,
-}
-
-pub(crate) trait ProvidesSandboxRetryData {
-    fn sandbox_retry_data(&self) -> Option<SandboxRetryData>;
-}
-
 #[derive(Debug)]
 pub(crate) enum ToolError {
     Rejected(String),
@@ -223,6 +274,7 @@ pub(crate) struct SandboxAttempt<'a> {
     pub(crate) manager: &'a SandboxManager,
     pub(crate) sandbox_cwd: &'a Path,
     pub codex_linux_sandbox_exe: Option<&'a std::path::PathBuf>,
+    pub windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel,
 }
 
 impl<'a> SandboxAttempt<'a> {
@@ -236,6 +288,41 @@ impl<'a> SandboxAttempt<'a> {
             self.sandbox,
             self.sandbox_cwd,
             self.codex_linux_sandbox_exe,
+            self.windows_sandbox_level,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::protocol::NetworkAccess;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn external_sandbox_skips_exec_approval_on_request() {
+        assert_eq!(
+            default_exec_approval_requirement(
+                AskForApproval::OnRequest,
+                &SandboxPolicy::ExternalSandbox {
+                    network_access: NetworkAccess::Restricted,
+                },
+            ),
+            ExecApprovalRequirement::Skip {
+                bypass_sandbox: false,
+                proposed_execpolicy_amendment: None,
+            }
+        );
+    }
+
+    #[test]
+    fn restricted_sandbox_requires_exec_approval_on_request() {
+        assert_eq!(
+            default_exec_approval_requirement(AskForApproval::OnRequest, &SandboxPolicy::ReadOnly),
+            ExecApprovalRequirement::NeedsApproval {
+                reason: None,
+                proposed_execpolicy_amendment: None,
+            }
+        );
     }
 }
