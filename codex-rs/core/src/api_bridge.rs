@@ -130,16 +130,7 @@ pub(crate) async fn auth_provider_from_auth(
             });
         }
         Ok(None) => {}
-        Err(err) => {
-            if let Some(auth) = auth.as_ref() {
-                let token = auth.get_token()?;
-                return Ok(CoreAuthProvider {
-                    token: Some(token),
-                    account_id: auth.get_account_id(),
-                });
-            }
-            return Err(err);
-        }
+        Err(err) => return Err(err),
     }
 
     if let Some(auth) = auth {
