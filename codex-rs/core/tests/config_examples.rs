@@ -16,14 +16,3 @@ fn config_example_azure_msi_parses() {
     assert!(cfg.model_providers.contains_key("azure-msi-responses"));
     assert!(cfg.profiles.contains_key("azure-msi-responses"));
 }
-
-#[test]
-fn config_example_azure_cli_and_interactive_parses() {
-    let toml_str = include_str!("../../docs/examples/config.azure-cli-browser.toml");
-    let cfg: ConfigToml = toml::from_str(toml_str).expect("example config.toml should parse");
-
-    assert!(cfg.model_providers.contains_key("azure-cli"));
-    assert!(cfg.profiles.contains_key("azure-cli"));
-    assert!(cfg.model_providers.contains_key("azure-interactive"));
-    assert!(cfg.profiles.contains_key("azure-interactive"));
-}

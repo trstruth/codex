@@ -82,16 +82,6 @@ pub enum ProviderAuth {
         #[serde(default)]
         scopes: Vec<String>,
     },
-    /// Acquire an OAuth access token via an interactive browser flow. Intended
-    /// for local development; will open a browser window on first use.
-    AzureInteractiveBrowser {
-        #[serde(default)]
-        scopes: Vec<String>,
-        #[serde(default)]
-        tenant_id: Option<String>,
-        #[serde(default)]
-        client_id: Option<String>,
-    },
 }
 
 /// Serializable representation of a provider definition.
@@ -279,15 +269,6 @@ impl ModelProviderInfo {
                 let token = azure_cli_get_token(&scopes).await?;
                 Ok(Some(token))
             }
-            ProviderAuth::AzureInteractiveBrowser {
-                scopes,
-                tenant_id,
-                client_id,
-            } => {
-                let token =
-                    azure_interactive_browser_get_token(&scopes, &tenant_id, &client_id).await?;
-                Ok(Some(token))
-            }
         }
     }
 
@@ -427,33 +408,6 @@ async fn azure_cli_get_token(_scopes: &Vec<String>) -> crate::error::Result<Stri
         std::io::Error::other("Azure CLI auth requires building with the 'azure-auth' feature")
             .into(),
     )
-}
-
-// --- Azure Interactive Browser credential (feature-gated) ---
-
-#[cfg(feature = "azure-auth")]
-async fn azure_interactive_browser_get_token(
-    scopes: &Vec<String>,
-    tenant_id: &Option<String>,
-    client_id: &Option<String>,
-) -> crate::error::Result<String> {
-    let _ = (scopes, tenant_id, client_id);
-    Err(std::io::Error::other(
-        "Azure Interactive Browser auth is not supported with the current azure_identity version; consider using Azure CLI auth instead",
-    )
-    .into())
-}
-
-#[cfg(not(feature = "azure-auth"))]
-async fn azure_interactive_browser_get_token(
-    _scopes: &Vec<String>,
-    _tenant_id: &Option<String>,
-    _client_id: &Option<String>,
-) -> crate::error::Result<String> {
-    Err(std::io::Error::other(
-        "Azure Interactive Browser auth requires building with the 'azure-auth' feature",
-    )
-    .into())
 }
 
 pub const DEFAULT_LMSTUDIO_PORT: u16 = 1234;

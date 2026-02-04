@@ -765,37 +765,6 @@
             "type"
           ],
           "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "description": "Acquire an OAuth access token via an interactive browser flow. Intended for local development; will open a browser window on first use.",
-          "properties": {
-            "client_id": {
-              "default": null,
-              "type": "string"
-            },
-            "scopes": {
-              "default": [],
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "tenant_id": {
-              "default": null,
-              "type": "string"
-            },
-            "type": {
-              "enum": [
-                "azure_interactive_browser"
-              ],
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "type": "object"
         }
       ]
     },
