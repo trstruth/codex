@@ -16,7 +16,7 @@ auth = { type = "azure_managed_identity", client_id = "YOUR-CLIENT-ID" }
 
 [profiles.azure-msi-chat]
 # Use a suitable model slug for your deployment
-model = "gpt-4o"
+model = "gpt-5.1-codex"
 model_provider = "azure-msi-chat"
 
 
@@ -31,4 +31,3 @@ auth = { type = "azure_managed_identity" }
 [profiles.azure-msi-responses]
 model = "o3"
 model_provider = "azure-msi-responses"
-
