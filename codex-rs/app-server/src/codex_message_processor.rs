@@ -176,7 +176,6 @@ use codex_core::CodexAuth;
 use codex_core::CodexThread;
 use codex_core::Cursor as RolloutCursor;
 use codex_core::NewThread;
-use codex_core::RolloutRecorder;
 use codex_core::SessionMeta;
 use codex_core::SteerInputError;
 use codex_core::ThreadConfigSnapshot;
@@ -2746,7 +2745,11 @@ impl CodexMessageProcessor {
         self.attach_thread_name(thread_uuid, &mut thread).await;
 
         if include_turns && let Some(rollout_path) = rollout_path.as_ref() {
-            match read_rollout_items_from_rollout(rollout_path).await {
+            match self
+                .thread_manager
+                .load_rollout_items(rollout_path.as_path())
+                .await
+            {
                 Ok(items) => {
                     thread.turns = build_turns_from_rollout_items(&items);
                 }
@@ -3200,7 +3203,7 @@ impl CodexMessageProcessor {
             }
         };
 
-        match RolloutRecorder::get_rollout_history(&rollout_path).await {
+        match self.thread_manager.get_rollout_history(&rollout_path).await {
             Ok(initial_history) => Some(initial_history),
             Err(err) => {
                 self.send_invalid_request_error(
@@ -3234,7 +3237,7 @@ impl CodexMessageProcessor {
                 return None;
             }
         };
-        match read_rollout_items_from_rollout(rollout_path).await {
+        match self.thread_manager.load_rollout_items(rollout_path).await {
             Ok(items) => {
                 thread.turns = build_turns_from_rollout_items(&items);
                 self.attach_thread_name(thread_id, &mut thread).await;
@@ -3463,7 +3466,11 @@ impl CodexMessageProcessor {
             }
         };
         // forked thread names do not inherit the source thread name
-        match read_rollout_items_from_rollout(rollout_path.as_path()).await {
+        match self
+            .thread_manager
+            .load_rollout_items(rollout_path.as_path())
+            .await
+        {
             Ok(items) => {
                 thread.turns = build_turns_from_rollout_items(&items);
             }
@@ -3659,37 +3666,39 @@ impl CodexMessageProcessor {
         while remaining > 0 {
             let page_size = remaining.min(THREAD_LIST_MAX_LIMIT);
             let page = if archived {
-                RolloutRecorder::list_archived_threads(
-                    &self.config,
-                    page_size,
-                    cursor_obj.as_ref(),
-                    sort_key,
-                    allowed_sources,
-                    model_provider_filter.as_deref(),
-                    fallback_provider.as_str(),
-                )
-                .await
-                .map_err(|err| JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!("failed to list threads: {err}"),
-                    data: None,
-                })?
+                self.thread_manager
+                    .list_archived_threads(
+                        &self.config,
+                        page_size,
+                        cursor_obj.as_ref(),
+                        sort_key,
+                        allowed_sources,
+                        model_provider_filter.as_deref(),
+                        fallback_provider.as_str(),
+                    )
+                    .await
+                    .map_err(|err| JSONRPCErrorError {
+                        code: INTERNAL_ERROR_CODE,
+                        message: format!("failed to list threads: {err}"),
+                        data: None,
+                    })?
             } else {
-                RolloutRecorder::list_threads(
-                    &self.config,
-                    page_size,
-                    cursor_obj.as_ref(),
-                    sort_key,
-                    allowed_sources,
-                    model_provider_filter.as_deref(),
-                    fallback_provider.as_str(),
-                )
-                .await
-                .map_err(|err| JSONRPCErrorError {
-                    code: INTERNAL_ERROR_CODE,
-                    message: format!("failed to list threads: {err}"),
-                    data: None,
-                })?
+                self.thread_manager
+                    .list_threads(
+                        &self.config,
+                        page_size,
+                        cursor_obj.as_ref(),
+                        sort_key,
+                        allowed_sources,
+                        model_provider_filter.as_deref(),
+                        fallback_provider.as_str(),
+                    )
+                    .await
+                    .map_err(|err| JSONRPCErrorError {
+                        code: INTERNAL_ERROR_CODE,
+                        message: format!("failed to list threads: {err}"),
+                        data: None,
+                    })?
             };
 
             let mut filtered = Vec::with_capacity(page.items.len());
@@ -4210,7 +4219,7 @@ impl CodexMessageProcessor {
         } = params;
 
         let thread_history = if let Some(path) = path {
-            match RolloutRecorder::get_rollout_history(&path).await {
+            match self.thread_manager.get_rollout_history(&path).await {
                 Ok(initial_history) => initial_history,
                 Err(err) => {
                     self.send_invalid_request_error(
@@ -4226,7 +4235,7 @@ impl CodexMessageProcessor {
                 .await
             {
                 Ok(Some(found_path)) => {
-                    match RolloutRecorder::get_rollout_history(&found_path).await {
+                    match self.thread_manager.get_rollout_history(&found_path).await {
                         Ok(initial_history) => initial_history,
                         Err(err) => {
                             self.send_invalid_request_error(
@@ -5966,6 +5975,7 @@ impl CodexMessageProcessor {
                             ) => {
                                 handle_pending_thread_resume_request(
                                     conversation_id,
+                                    thread_manager.clone(),
                                     codex_home.as_path(),
                                     &thread_state,
                                     &thread_watch_manager,
@@ -6286,6 +6296,7 @@ impl CodexMessageProcessor {
 
 async fn handle_pending_thread_resume_request(
     conversation_id: ThreadId,
+    thread_manager: Arc<ThreadManager>,
     codex_home: &Path,
     thread_state: &Arc<Mutex<ThreadState>>,
     thread_watch_manager: &ThreadWatchManager,
@@ -6315,6 +6326,7 @@ async fn handle_pending_thread_resume_request(
         pending.rollout_path.as_path(),
         pending.config_snapshot.model_provider_id.as_str(),
         active_turn.as_ref(),
+        &thread_manager,
     )
     .await
     {
@@ -6380,6 +6392,7 @@ async fn load_thread_for_running_resume_response(
     rollout_path: &Path,
     fallback_provider: &str,
     active_turn: Option<&Turn>,
+    thread_manager: &ThreadManager,
 ) -> std::result::Result<Thread, String> {
     let mut thread = read_summary_from_rollout(rollout_path, fallback_provider)
         .await
@@ -6391,7 +6404,8 @@ async fn load_thread_for_running_resume_response(
             )
         })?;
 
-    let mut turns = read_rollout_items_from_rollout(rollout_path)
+    let mut turns = thread_manager
+        .load_rollout_items(rollout_path)
         .await
         .map(|items| build_turns_from_rollout_items(&items))
         .map_err(|err| {
@@ -6934,18 +6948,6 @@ pub(crate) async fn read_summary_from_rollout(
         source: session_meta.source,
         git_info,
     })
-}
-
-pub(crate) async fn read_rollout_items_from_rollout(
-    path: &Path,
-) -> std::io::Result<Vec<RolloutItem>> {
-    let items = match RolloutRecorder::get_rollout_history(path).await? {
-        InitialHistory::New => Vec::new(),
-        InitialHistory::Forked(items) => items,
-        InitialHistory::Resumed(resumed) => resumed.history,
-    };
-
-    Ok(items)
 }
 
 fn extract_conversation_summary(

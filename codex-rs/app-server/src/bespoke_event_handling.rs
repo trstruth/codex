@@ -1,5 +1,4 @@
 use crate::codex_message_processor::ApiVersion;
-use crate::codex_message_processor::read_rollout_items_from_rollout;
 use crate::codex_message_processor::read_summary_from_rollout;
 use crate::codex_message_processor::summary_to_thread;
 use crate::error_code::INTERNAL_ERROR_CODE;
@@ -1222,7 +1221,10 @@ pub(crate) async fn apply_bespoke_event_handling(
                 {
                     Ok(summary) => {
                         let mut thread = summary_to_thread(summary);
-                        match read_rollout_items_from_rollout(rollout_path.as_path()).await {
+                        match thread_manager
+                            .load_rollout_items(rollout_path.as_path())
+                            .await
+                        {
                             Ok(items) => {
                                 thread.turns = build_turns_from_rollout_items(&items);
                                 thread.status = thread_watch_manager

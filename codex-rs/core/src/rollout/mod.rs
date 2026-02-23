@@ -13,6 +13,7 @@ pub(crate) mod metadata;
 pub(crate) mod policy;
 pub mod recorder;
 pub(crate) mod session_index;
+mod storage;
 pub(crate) mod truncation;
 
 pub use codex_protocol::protocol::SessionMeta;
@@ -26,6 +27,7 @@ pub use recorder::RolloutRecorder;
 pub use recorder::RolloutRecorderParams;
 pub use session_index::find_thread_name_by_id;
 pub use session_index::find_thread_path_by_name_str;
+pub use storage::{FileRolloutStore, LiveRolloutRecorder, RolloutHistoryStore};
 
 #[cfg(test)]
 pub mod tests;

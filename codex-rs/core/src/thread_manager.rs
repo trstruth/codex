@@ -15,7 +15,11 @@ use crate::models_manager::manager::ModelsManager;
 use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::SessionConfiguredEvent;
-use crate::rollout::RolloutRecorder;
+use crate::rollout::FileRolloutStore;
+use crate::rollout::RolloutHistoryStore;
+use crate::rollout::list::Cursor;
+use crate::rollout::list::ThreadSortKey;
+use crate::rollout::list::ThreadsPage;
 use crate::rollout::truncation;
 use crate::skills::SkillsManager;
 use codex_protocol::ThreadId;
@@ -28,6 +32,8 @@ use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use std::collections::HashMap;
+use std::io;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -133,6 +139,7 @@ pub(crate) struct ThreadManagerState {
     skills_manager: Arc<SkillsManager>,
     file_watcher: Arc<FileWatcher>,
     session_source: SessionSource,
+    rollout_history_store: Arc<dyn RolloutHistoryStore>,
     // Captures submitted ops for testing purpose when test mode is enabled.
     ops_log: Option<SharedCapturedOps>,
 }
@@ -143,6 +150,22 @@ impl ThreadManager {
         auth_manager: Arc<AuthManager>,
         session_source: SessionSource,
         model_catalog: Option<ModelsResponse>,
+    ) -> Self {
+        Self::new_with_rollout_history_store(
+            codex_home,
+            auth_manager,
+            session_source,
+            model_catalog,
+            Arc::new(FileRolloutStore),
+        )
+    }
+
+    fn new_with_rollout_history_store(
+        codex_home: PathBuf,
+        auth_manager: Arc<AuthManager>,
+        session_source: SessionSource,
+        model_catalog: Option<ModelsResponse>,
+        rollout_history_store: Arc<dyn RolloutHistoryStore>,
     ) -> Self {
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
         let skills_manager = Arc::new(SkillsManager::new(codex_home.clone()));
@@ -160,6 +183,7 @@ impl ThreadManager {
                 file_watcher,
                 auth_manager,
                 session_source,
+                rollout_history_store,
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             }),
@@ -211,6 +235,7 @@ impl ThreadManager {
                 file_watcher,
                 auth_manager,
                 session_source: SessionSource::Exec,
+                rollout_history_store: Arc::new(FileRolloutStore),
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             }),
@@ -310,7 +335,11 @@ impl ThreadManager {
         rollout_path: PathBuf,
         auth_manager: Arc<AuthManager>,
     ) -> CodexResult<NewThread> {
-        let initial_history = RolloutRecorder::get_rollout_history(&rollout_path).await?;
+        let initial_history = self
+            .state
+            .rollout_history_store
+            .get_rollout_history(&rollout_path)
+            .await?;
         self.resume_thread_with_history(config, initial_history, auth_manager, false)
             .await
     }
@@ -361,7 +390,11 @@ impl ThreadManager {
         path: PathBuf,
         persist_extended_history: bool,
     ) -> CodexResult<NewThread> {
-        let history = RolloutRecorder::get_rollout_history(&path).await?;
+        let history = self
+            .state
+            .rollout_history_store
+            .get_rollout_history(&path)
+            .await?;
         let history = truncate_before_nth_user_message(history, nth_user_message);
         self.state
             .spawn_thread(
@@ -371,6 +404,70 @@ impl ThreadManager {
                 self.agent_control(),
                 Vec::new(),
                 persist_extended_history,
+            )
+            .await
+    }
+
+    pub async fn get_rollout_history(&self, path: &Path) -> io::Result<InitialHistory> {
+        self.state
+            .rollout_history_store
+            .get_rollout_history(path)
+            .await
+    }
+
+    pub async fn load_rollout_items(&self, path: &Path) -> io::Result<Vec<RolloutItem>> {
+        let (items, _, _) = self
+            .state
+            .rollout_history_store
+            .load_rollout_items(path)
+            .await?;
+        Ok(items)
+    }
+
+    pub async fn list_threads(
+        &self,
+        config: &Config,
+        page_size: usize,
+        cursor: Option<&Cursor>,
+        sort_key: ThreadSortKey,
+        allowed_sources: &[SessionSource],
+        model_providers: Option<&[String]>,
+        default_provider: &str,
+    ) -> io::Result<ThreadsPage> {
+        self.state
+            .rollout_history_store
+            .list_threads(
+                config,
+                page_size,
+                cursor,
+                sort_key,
+                allowed_sources,
+                model_providers,
+                default_provider,
+            )
+            .await
+    }
+
+    pub async fn list_archived_threads(
+        &self,
+        config: &Config,
+        page_size: usize,
+        cursor: Option<&Cursor>,
+        sort_key: ThreadSortKey,
+        allowed_sources: &[SessionSource],
+        model_providers: Option<&[String]>,
+        default_provider: &str,
+    ) -> io::Result<ThreadsPage> {
+        self.state
+            .rollout_history_store
+            .list_archived_threads(
+                config,
+                page_size,
+                cursor,
+                sort_key,
+                allowed_sources,
+                model_providers,
+                default_provider,
             )
             .await
     }
@@ -451,7 +548,10 @@ impl ThreadManagerState {
         agent_control: AgentControl,
         session_source: SessionSource,
     ) -> CodexResult<NewThread> {
-        let initial_history = RolloutRecorder::get_rollout_history(&rollout_path).await?;
+        let initial_history = self
+            .rollout_history_store
+            .get_rollout_history(&rollout_path)
+            .await?;
         self.spawn_thread_with_source(
             config,
             initial_history,

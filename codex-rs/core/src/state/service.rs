@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::AuthManager;
-use crate::RolloutRecorder;
+use crate::LiveRolloutRecorder;
 use crate::agent::AgentControl;
 use crate::analytics_client::AnalyticsEventsClient;
 use crate::client::ModelClient;
@@ -30,7 +30,7 @@ pub(crate) struct SessionServices {
     pub(crate) zsh_exec_bridge: ZshExecBridge,
     pub(crate) analytics_events_client: AnalyticsEventsClient,
     pub(crate) hooks: Hooks,
-    pub(crate) rollout: Mutex<Option<RolloutRecorder>>,
+    pub(crate) rollout: Mutex<Option<Arc<dyn LiveRolloutRecorder>>>,
     pub(crate) user_shell: Arc<crate::shell::Shell>,
     pub(crate) shell_snapshot_tx: watch::Sender<Option<Arc<crate::shell_snapshot::ShellSnapshot>>>,
     pub(crate) show_raw_agent_reasoning: bool,

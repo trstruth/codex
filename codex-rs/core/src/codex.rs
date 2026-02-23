@@ -206,6 +206,7 @@ use crate::protocol::TokenUsage;
 use crate::protocol::TokenUsageInfo;
 use crate::protocol::TurnDiffEvent;
 use crate::protocol::WarningEvent;
+use crate::rollout::LiveRolloutRecorder;
 use crate::rollout::RolloutRecorder;
 use crate::rollout::RolloutRecorderParams;
 use crate::rollout::map_session_init_error;
@@ -1115,6 +1116,8 @@ impl Session {
             error!("failed to initialize rollout recorder: {e:#}");
             e
         })?;
+        let rollout_recorder =
+            rollout_recorder.map(|recorder| Arc::new(recorder) as Arc<dyn LiveRolloutRecorder>);
         let rollout_path = rollout_recorder
             .as_ref()
             .map(|rec| rec.rollout_path.clone());
