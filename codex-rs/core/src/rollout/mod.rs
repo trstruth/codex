@@ -27,7 +27,9 @@ pub use recorder::RolloutRecorder;
 pub use recorder::RolloutRecorderParams;
 pub use session_index::find_thread_name_by_id;
 pub use session_index::find_thread_path_by_name_str;
-pub use storage::{FileRolloutStore, LiveRolloutRecorder, RolloutHistoryStore};
+pub use storage::FileRolloutStore;
+pub use storage::LiveRolloutRecorder;
+pub use storage::RolloutHistoryStore;
 
 #[cfg(test)]
 pub mod tests;
