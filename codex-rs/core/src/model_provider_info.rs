@@ -65,6 +65,38 @@ impl<'de> Deserialize<'de> for WireApi {
     }
 }
 
+/// Optional authentication strategies a provider can use to obtain a Bearer token
+/// dynamically (for example, Azure Managed Identity).
+///
+/// These take precedence over static API keys and global OpenAI or ChatGPT auth
+/// when present.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderAuth {
+    /// Acquire an OAuth access token via Azure Managed Identity.
+    ///
+    /// If `scopes` is omitted or empty, defaults to
+    /// `https://cognitiveservices.azure.com/.default`.
+    AzureManagedIdentity {
+        /// OAuth scopes to request for the managed identity token.
+        #[serde(default)]
+        scopes: Vec<String>,
+        /// Optional client ID for a user-assigned managed identity.
+        #[serde(default)]
+        client_id: Option<String>,
+    },
+    /// Acquire an OAuth access token via the Azure CLI credential.
+    ///
+    /// This uses the current `az login` session and is intended for developer
+    /// interactive environments.
+    AzureCli {
+        /// OAuth scopes to request from the Azure CLI credential.
+        #[serde(default)]
+        scopes: Vec<String>,
+    },
+}
+
 /// Serializable representation of a provider definition.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
@@ -118,6 +150,13 @@ pub struct ModelProviderInfo {
     /// and API key (if needed) comes from the "env_key" environment variable.
     #[serde(default)]
     pub requires_openai_auth: bool,
+
+    /// Optional dynamic authentication configuration for this provider.
+    ///
+    /// When present, this takes precedence over `env_key` and global
+    /// OpenAI/ChatGPT auth.
+    #[serde(default)]
+    pub auth: Option<ProviderAuth>,
 
     /// Whether this provider supports the Responses API WebSocket transport.
     #[serde(default)]
@@ -227,6 +266,25 @@ impl ModelProviderInfo {
             .unwrap_or(Duration::from_millis(DEFAULT_STREAM_IDLE_TIMEOUT_MS))
     }
 
+    /// Try to obtain a Bearer token using the provider's dynamic auth config.
+    /// Returns Ok(None) when no dynamic auth is configured.
+    pub(crate) async fn get_dynamic_bearer_token(&self) -> crate::error::Result<Option<String>> {
+        let Some(auth) = &self.auth else {
+            return Ok(None);
+        };
+
+        match auth {
+            ProviderAuth::AzureManagedIdentity { scopes, client_id } => {
+                let token = azure_mi_get_token(scopes, client_id.as_deref()).await?;
+                Ok(Some(token))
+            }
+            ProviderAuth::AzureCli { scopes } => {
+                let token = azure_cli_get_token(scopes).await?;
+                Ok(Some(token))
+            }
+        }
+    }
+
     pub fn create_openai_provider(base_url: Option<String>) -> ModelProviderInfo {
         ModelProviderInfo {
             name: OPENAI_PROVIDER_NAME.into(),
@@ -257,6 +315,7 @@ impl ModelProviderInfo {
             stream_max_retries: None,
             stream_idle_timeout_ms: None,
             requires_openai_auth: true,
+            auth: None,
             supports_websockets: true,
         }
     }
@@ -264,6 +323,77 @@ impl ModelProviderInfo {
     pub fn is_openai(&self) -> bool {
         self.name == OPENAI_PROVIDER_NAME
     }
+}
+
+#[cfg(feature = "azure-auth")]
+async fn azure_mi_get_token(
+    scopes: &[String],
+    client_id: Option<&str>,
+) -> crate::error::Result<String> {
+    use azure_core::credentials::TokenCredential;
+    use azure_core::credentials::TokenRequestOptions;
+    use azure_identity::ManagedIdentityCredential;
+    use azure_identity::ManagedIdentityCredentialOptions;
+    use azure_identity::UserAssignedId;
+
+    let mut options = ManagedIdentityCredentialOptions::default();
+    if let Some(cid) = client_id {
+        options.user_assigned_id = Some(UserAssignedId::ClientId(cid.to_string()));
+    }
+    let cred = ManagedIdentityCredential::new(Some(options)).map_err(std::io::Error::other)?;
+
+    let scope = scopes
+        .first()
+        .map(String::as_str)
+        .unwrap_or("https://cognitiveservices.azure.com/.default");
+    let token = cred
+        .get_token(&[scope], Some(TokenRequestOptions::default()))
+        .await
+        .map_err(std::io::Error::other)?
+        .token
+        .secret()
+        .to_string();
+    Ok(token)
+}
+
+#[cfg(not(feature = "azure-auth"))]
+async fn azure_mi_get_token(
+    _scopes: &[String],
+    _client_id: Option<&str>,
+) -> crate::error::Result<String> {
+    Err(std::io::Error::other(
+        "Azure Managed Identity auth requires building with the 'azure-auth' feature",
+    )
+    .into())
+}
+
+#[cfg(feature = "azure-auth")]
+async fn azure_cli_get_token(scopes: &[String]) -> crate::error::Result<String> {
+    use azure_core::credentials::TokenCredential;
+    use azure_core::credentials::TokenRequestOptions;
+    use azure_identity::AzureCliCredential;
+
+    let scope = scopes
+        .first()
+        .map(String::as_str)
+        .unwrap_or("https://cognitiveservices.azure.com/.default");
+    let cred = AzureCliCredential::new(None).map_err(std::io::Error::other)?;
+    let token = cred
+        .get_token(&[scope], Some(TokenRequestOptions::default()))
+        .await
+        .map_err(std::io::Error::other)?
+        .token
+        .secret()
+        .to_string();
+    Ok(token)
+}
+
+#[cfg(not(feature = "azure-auth"))]
+async fn azure_cli_get_token(_scopes: &[String]) -> crate::error::Result<String> {
+    Err(
+        std::io::Error::other("Azure CLI auth requires building with the 'azure-auth' feature")
+            .into(),
+    )
 }
 
 pub const DEFAULT_LMSTUDIO_PORT: u16 = 1234;
@@ -333,6 +463,7 @@ pub fn create_oss_provider_with_base_url(base_url: &str, wire_api: WireApi) -> M
         stream_max_retries: None,
         stream_idle_timeout_ms: None,
         requires_openai_auth: false,
+        auth: None,
         supports_websockets: false,
     }
 }

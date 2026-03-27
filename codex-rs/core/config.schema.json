@@ -808,6 +808,15 @@
       "additionalProperties": false,
       "description": "Serializable representation of a provider definition.",
       "properties": {
+        "auth": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProviderAuth"
+            }
+          ],
+          "default": null,
+          "description": "Optional dynamic authentication configuration for this provider.\n\nWhen present, this takes precedence over `env_key` and global OpenAI/ChatGPT auth."
+        },
         "base_url": {
           "description": "Base URL for the provider's OpenAI-compatible API.",
           "type": "string"
@@ -1235,6 +1244,64 @@
         }
       },
       "type": "object"
+    },
+    "ProviderAuth": {
+      "description": "Optional authentication strategies a provider can use to obtain a Bearer token dynamically (for example, Azure Managed Identity).\n\nThese take precedence over static API keys and global OpenAI or ChatGPT auth when present.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Acquire an OAuth access token via Azure Managed Identity.\n\nIf `scopes` is omitted or empty, defaults to `https://cognitiveservices.azure.com/.default`.",
+          "properties": {
+            "client_id": {
+              "default": null,
+              "description": "Optional client ID for a user-assigned managed identity.",
+              "type": "string"
+            },
+            "scopes": {
+              "default": [],
+              "description": "OAuth scopes to request for the managed identity token.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "azure_managed_identity"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Acquire an OAuth access token via the Azure CLI credential.\n\nThis uses the current `az login` session and is intended for developer interactive environments.",
+          "properties": {
+            "scopes": {
+              "default": [],
+              "description": "OAuth scopes to request from the Azure CLI credential.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "azure_cli"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "RawMcpServerConfig": {
       "additionalProperties": false,

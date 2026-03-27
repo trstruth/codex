@@ -21,6 +21,7 @@ base_url = "http://localhost:11434/v1"
         stream_max_retries: None,
         stream_idle_timeout_ms: None,
         requires_openai_auth: false,
+        auth: None,
         supports_websockets: false,
     };
 
@@ -52,6 +53,7 @@ query_params = { api-version = "2025-04-01-preview" }
         stream_max_retries: None,
         stream_idle_timeout_ms: None,
         requires_openai_auth: false,
+        auth: None,
         supports_websockets: false,
     };
 
@@ -86,10 +88,74 @@ env_http_headers = { "X-Example-Env-Header" = "EXAMPLE_ENV_VAR" }
         stream_max_retries: None,
         stream_idle_timeout_ms: None,
         requires_openai_auth: false,
+        auth: None,
         supports_websockets: false,
     };
 
     let provider: ModelProviderInfo = toml::from_str(azure_provider_toml).unwrap();
+    assert_eq!(expected_provider, provider);
+}
+
+#[test]
+fn test_deserialize_provider_with_dynamic_auth() {
+    let provider_toml = r#"
+name = "Azure via MSI"
+base_url = "https://example.openai.azure.com/openai"
+auth = { type = "azure_managed_identity", client_id = "client-123" }
+    "#;
+    let expected_provider = ModelProviderInfo {
+        name: "Azure via MSI".into(),
+        base_url: Some("https://example.openai.azure.com/openai".into()),
+        env_key: None,
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        requires_openai_auth: false,
+        auth: Some(ProviderAuth::AzureManagedIdentity {
+            scopes: Vec::new(),
+            client_id: Some("client-123".into()),
+        }),
+        supports_websockets: false,
+    };
+
+    let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
+    assert_eq!(expected_provider, provider);
+}
+
+#[test]
+fn test_deserialize_provider_with_azure_cli_dynamic_auth() {
+    let provider_toml = r#"
+name = "Azure via CLI"
+base_url = "https://example.openai.azure.com/openai"
+auth = { type = "azure_cli", scopes = ["https://cognitiveservices.azure.com/.default"] }
+    "#;
+    let expected_provider = ModelProviderInfo {
+        name: "Azure via CLI".into(),
+        base_url: Some("https://example.openai.azure.com/openai".into()),
+        env_key: None,
+        env_key_instructions: None,
+        experimental_bearer_token: None,
+        wire_api: WireApi::Responses,
+        query_params: None,
+        http_headers: None,
+        env_http_headers: None,
+        request_max_retries: None,
+        stream_max_retries: None,
+        stream_idle_timeout_ms: None,
+        requires_openai_auth: false,
+        auth: Some(ProviderAuth::AzureCli {
+            scopes: vec!["https://cognitiveservices.azure.com/.default".into()],
+        }),
+        supports_websockets: false,
+    };
+
+    let provider: ModelProviderInfo = toml::from_str(provider_toml).unwrap();
     assert_eq!(expected_provider, provider);
 }
 

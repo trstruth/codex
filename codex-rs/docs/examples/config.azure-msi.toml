@@ -1,0 +1,24 @@
+# Example configuration for using Azure OpenAI with Managed Identity (MSI)
+#
+# Requires a Codex build with the `azure-auth` feature enabled.
+
+# Choose the profile below when launching Codex, e.g.:
+#   codex --profile azure-msi
+
+[model_providers.azure-msi]
+name = "Azure via MSI"
+base_url = "https://YOUR_RESOURCE.openai.azure.com/openai"
+wire_api = "responses"
+query_params = { api-version = "2025-04-01-preview" }
+
+# Dynamic auth via Azure Managed Identity.
+# For user-assigned MI, either set `client_id` here or export AZURE_CLIENT_ID.
+auth = { type = "azure_managed_identity", client_id = "YOUR-CLIENT-ID" }
+
+[profiles.azure-msi]
+model = "gpt-5"
+model_provider = "azure-msi"
+
+# For developer machines that already use `az login`, you can swap the auth line
+# above to:
+# auth = { type = "azure_cli" }

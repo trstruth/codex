@@ -30,6 +30,11 @@ When Codex knows which client started the turn, the legacy notify JSON payload a
 
 The generated JSON Schema for `config.toml` lives at `codex-rs/core/config.schema.json`.
 
+## Azure provider auth example
+
+An example provider profile that uses Azure Managed Identity lives at
+`codex-rs/docs/examples/config.azure-msi.toml`.
+
 ## SQLite State DB
 
 Codex stores the SQLite-backed state DB under `sqlite_home` (config key) or the
